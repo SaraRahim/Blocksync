@@ -145,48 +145,93 @@ useEffect(() => {
         const shouldInitiate = yourId.localeCompare(peerInfo.id) > 0;
         console.log(`Should initiate connection to ${peerInfo.id}? ${shouldInitiate}`);
         
-        // Only create connection as initiator if we should be the initiator
-        if (shouldInitiate) {
-          console.log(`Creating connection to ${peerInfo.id} as initiator`);
-          
-          // Check if we already have a connection for this peer
-          if (peers.current[peerInfo.id]) {
-            console.log(`Already have a peer object for ${peerInfo.id}, destroying it first`);
-            if (peers.current[peerInfo.id].destroy) {
-              peers.current[peerInfo.id].destroy();
-            } else if (peers.current[peerInfo.id].peer && peers.current[peerInfo.id].peer.destroy) {
-              peers.current[peerInfo.id].peer.destroy();
+        // Track connection state to prevent duplicate connections
+        const peerConnectionState = {
+          id: peerInfo.id,
+          connectionAttemptTime: Date.now(),
+          shouldInitiate
+        };
+        
+        // Store the connection state for this peer
+        if (!peers.current[peerInfo.id] || peers.current[peerInfo.id].status === 'error') {
+          // Only create a new connection if we're the initiator and there isn't already a connection
+          // OR if there's an existing connection in error state
+          if (shouldInitiate) {
+            console.log(`Creating connection to ${peerInfo.id} as initiator`);
+            
+            // Clean up any existing connection properly
+            if (peers.current[peerInfo.id]) {
+              await safeDestroyPeer(peerInfo.id);
+              delete peers.current[peerInfo.id];
+              
+              // Give time for cleanup to complete
+              await new Promise(resolve => setTimeout(resolve, 500));
             }
-            delete peers.current[peerInfo.id];
+            
+            // Create and store preliminary connection state before actual connection
+            peers.current[peerInfo.id] = {
+              status: 'connecting',
+              peerId: peerInfo.id,
+              isInitiator: true,
+              ...peerConnectionState
+            };
+            
+            // Create new connection
+            try {
+              const peerConnection = await createPeerConnection(peerInfo.id, true, signalingServer);
+              
+              // Update with full connection info only if our connecting state still matches
+              // This prevents race conditions with simultaneous connection attempts
+              if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
+                peers.current[peerInfo.id] = {
+                  ...peerConnection,
+                  isInitiator: true,
+                  ...peerConnectionState
+                };
+              // } else {
+              //   // A newer connection attempt has replaced our state, destroy this connection
+              //   if (peerConnection.destroy) peerConnection.destroy();
+              //   else if (peerConnection.peer && peerConnection.peer.destroy) peerConnection.peer.destroy();
+              }
+            } catch (error) {
+              console.error(`Error creating connection to ${peerInfo.id}:`, error);
+              if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
+                peers.current[peerInfo.id].status = 'error';
+              }
+            }
+          } else {
+            console.log(`Waiting for ${peerInfo.id} to initiate connection to us`);
+            // Store state showing we're expecting an inbound connection
+            peers.current[peerInfo.id] = {
+              status: 'awaiting_offer',
+              peerId: peerInfo.id,
+              isInitiator: false,
+              ...peerConnectionState
+            };
           }
-          
-          // Create new connection
-          const peerConnection = await createPeerConnection(peerInfo.id, true, signalingServer);
-          peers.current[peerInfo.id] = peerConnection;
         } else {
-          console.log(`Waiting for ${peerInfo.id} to initiate connection to us`);
-          // We don't create a connection here - the other peer will initiate
+          console.log(`Connection already exists or in progress for peer ${peerInfo.id}`);
         }
-  
-  // Check for common folders (keep this logic in both cases)
-  const commonFolders = syncFolders.filter(folder => 
-    peerInfo.folders.some(f => f.secretKey === folder.secretKey)
-  );
-  
-  console.log(`Common folders with peer ${peerInfo.id}:`, commonFolders.length);
-  
-  if (commonFolders.length > 0) {
-    // We have common folders with this peer, update folder device count
-    commonFolders.forEach(folder => {
-      // Update folder in state
-      setSyncFolders(prev => prev.map(f => 
-        f.id === folder.id
-          ? { ...f, devices: f.devices + 1, peers: [...(f.peers || []), peerInfo.id] }
-          : f
-      ));
-    });
-  }
-});
+        
+        // Check for common folders (keep this logic in both cases)
+        const commonFolders = syncFolders.filter(folder => 
+          peerInfo.folders.some(f => f.secretKey === folder.secretKey)
+        );
+        
+        console.log(`Common folders with peer ${peerInfo.id}:`, commonFolders.length);
+        
+        if (commonFolders.length > 0) {
+          // We have common folders with this peer, update folder device count
+          commonFolders.forEach(folder => {
+            // Update folder in state
+            setSyncFolders(prev => prev.map(f => 
+              f.id === folder.id
+                ? { ...f, devices: f.devices + 1, peers: [...(f.peers || []), peerInfo.id] }
+                : f
+            ));
+          });
+        }
+      });
       
       // Listen for peer disconnect events
       signalingServer.on('peer-left', (peerId) => {
@@ -194,7 +239,7 @@ useEffect(() => {
         
         // Clean up peer connection
         if (peers.current[peerId]) {
-          safeDestroyPeer(peerId)
+          safeDestroyPeer(peerId);
           delete peers.current[peerId];
         }
         
@@ -225,67 +270,149 @@ useEffect(() => {
         const { from, signal } = data;
         
         console.log(`📥 Received signal from ${from}, type: ${signal.type || 'candidate'}`);
-        console.log(`DEBUG: Current peers:`, Object.keys(peers.current));
-        console.log(`DEBUG: Has peer ${from}?`, !!peers.current[from]);
         
         try {
           const yourId = signalingServer.networkId;
           const shouldBeInitiator = yourId.localeCompare(from) > 0;
           
-          // Handle the case where we receive an offer but we should be initiator
-          if (signal.type === 'offer' && shouldBeInitiator) {
-            console.log(`Received offer from ${from} but we should be initiator. This is a race condition.`);
+          // Get current peer state
+          const peerState = peers.current[from];
+          
+          // CASE 1: We receive an offer and we're in awaiting_offer state (we're the receiver)
+          if (signal.type === 'offer' && peerState && peerState.status === 'awaiting_offer' && !shouldBeInitiator) {
+            console.log(`Received expected offer from ${from}, creating receiver connection`);
             
-            // Conflict resolution: the peer with the "higher" ID wins and becomes initiator
-            if (peers.current[from]) {
-              console.log(`Destroying existing peer to resolve conflict`);
-              if (peers.current[from].destroy) {
-                peers.current[from].destroy();
-              } else if (peers.current[from].peer && peers.current[from].peer.destroy) {
-                peers.current[from].peer.destroy();
+            try {
+              // Create receiver connection
+              const peerConnection = await createPeerConnection(from, false, signalingServer);
+              
+              // Store the connection and immediately process the offer
+              peers.current[from] = {
+                ...peerConnection,
+                status: 'connecting',
+                peerId: from,
+                isInitiator: false,
+                connectionAttemptTime: Date.now()
+              };
+              
+              // Process the offer signal
+              if (peerConnection.peer && !peerConnection.peer._destroyed) {
+                peerConnection.peer.signal(signal);
               }
-              delete peers.current[from];
+            } catch (error) {
+              console.error(`Error creating receiver connection for ${from}:`, error);
+              peers.current[from].status = 'error';
             }
-            
-            // Wait a random time (to avoid another race condition)
-            const waitTime = Math.floor(Math.random() * 1000) + 500; // 500-1500ms
-            console.log(`Waiting ${waitTime}ms before recreating connection`);
-            
-            setTimeout(async () => {
-              console.log(`Creating new connection to ${from} after conflict resolution`);
-              const peerConnection = await createPeerConnection(from, true, signalingServer);
-              peers.current[from] = peerConnection;
-            }, waitTime);
             
             return;
           }
           
-          // If we don't have a connection to this peer yet, create one as receiver
-          // but only if we should be the receiver
-          if (!peers.current[from]) {
-            if (!shouldBeInitiator && signal.type === 'offer') {
-              console.log(`Creating new peer connection to ${from} as receiver`);
-              const peerConnection = await createPeerConnection(from, false, signalingServer);
-              peers.current[from] = peerConnection;
-            } else if (shouldBeInitiator) {
-              console.log(`Expected to be initiator for ${from}, not creating receiver connection`);
-              return; // Don't process this signal
-            } else {
-              console.log(`No peer object for ${from} and signal is not an offer. Ignoring.`);
+          // CASE 2: We receive an offer but we should be initiator (conflict)
+          if (signal.type === 'offer' && shouldBeInitiator) {
+            console.log(`Received unexpected offer from ${from} but we should be initiator`);
+            
+            // If we're already connected or connecting as initiator, ignore this offer
+            if (peerState && (peerState.status === 'connected' || 
+                (peerState.status === 'connecting' && peerState.isInitiator))) {
+              console.log(`We're already connecting as initiator, ignoring offer`);
               return;
             }
+            
+            // If we don't have an active connection attempt or our attempt is older,
+            // we'll defer to the peer's offer
+            if (!peerState || 
+                (peerState.connectionAttemptTime && 
+                 Date.now() - peerState.connectionAttemptTime > 5000)) {
+              
+              console.log(`Accepting offer from ${from} despite being expected initiator`);
+              
+              // Clean up any existing connection
+              if (peerState) {
+                await safeDestroyPeer(from);
+              }
+              
+              // Create new connection as receiver
+              try {
+                const peerConnection = await createPeerConnection(from, false, signalingServer);
+                peers.current[from] = {
+                  ...peerConnection,
+                  status: 'connecting',
+                  peerId: from,
+                  isInitiator: false,
+                  connectionAttemptTime: Date.now()
+                };
+                
+                // Process the offer signal
+                if (peerConnection.peer && !peerConnection.peer._destroyed) {
+                  peerConnection.peer.signal(signal);
+                }
+              } catch (error) {
+                console.error(`Error creating receiver connection for ${from}:`, error);
+                if (peers.current[from]) peers.current[from].status = 'error';
+              }
+            }
+            
+            return;
           }
           
-          // Process the signal if we have a valid peer
-          if (peers.current[from] && peers.current[from].peer) {
-            // Check if peer is destroyed before signaling
-            if (!peers.current[from].peer._destroyed) {
-              console.log(`Processing signal for peer ${from}`);
-              peers.current[from].peer.signal(signal);
+          // CASE 3: Process signals for existing peer connections
+          if (peerState && peerState.peer) {
+            // Only process signals if the peer is not destroyed
+            if (!peerState.peer._destroyed) {
+              console.log(`Processing ${signal.type || 'candidate'} signal for existing peer ${from}`);
+              peerState.peer.signal(signal);
             } else {
               console.log(`Cannot process signal: Peer ${from} is destroyed`);
               // Remove destroyed peer from our records
               delete peers.current[from];
+              
+              // If this was a non-offer signal, we might need to create a new connection
+              if (signal.type !== 'offer' && shouldBeInitiator) {
+                console.log(`Initiating new connection to replace destroyed peer ${from}`);
+                try {
+                  const peerConnection = await createPeerConnection(from, true, signalingServer);
+                  peers.current[from] = {
+                    ...peerConnection,
+                    status: 'connecting',
+                    peerId: from,
+                    isInitiator: true,
+                    connectionAttemptTime: Date.now()
+                  };
+                } catch (error) {
+                  console.error(`Error creating new initiator connection for ${from}:`, error);
+                }
+              }
+            }
+            
+            return;
+          }
+          
+          // CASE 4: No existing peer, but received a non-offer signal
+          if (!peerState && signal.type !== 'offer') {
+            console.log(`Received non-offer signal from unknown peer ${from}, ignoring`);
+            return;
+          }
+          
+          // CASE 5: No existing peer, received an offer, and we should be receiver
+          if (!peerState && signal.type === 'offer' && !shouldBeInitiator) {
+            console.log(`Creating new peer connection to ${from} as receiver from offer`);
+            try {
+              const peerConnection = await createPeerConnection(from, false, signalingServer);
+              peers.current[from] = {
+                ...peerConnection,
+                status: 'connecting',
+                peerId: from,
+                isInitiator: false,
+                connectionAttemptTime: Date.now()
+              };
+              
+              // Process the offer signal
+              if (peerConnection.peer && !peerConnection.peer._destroyed) {
+                peerConnection.peer.signal(signal);
+              }
+            } catch (error) {
+              console.error(`Error creating receiver connection for ${from}:`, error);
+              if (peers.current[from]) peers.current[from].status = 'error';
             }
           }
         } catch (error) {
@@ -315,27 +442,45 @@ useEffect(() => {
   connectToPeerNetwork();
   
   // Cleanup when component unmounts or user logs out
-  return () => {
-    // Disconnect from signaling server
-    if (socket.current) {
-      socket.current.disconnect();
-    }
-    
-    // Close all peer connections
-    Object.values(peers.current).forEach(peer => {
-      if (peer && peer.destroy) {
-        peer.destroy();
+return () => {
+  console.log('Performing cleanup of WebRTC connections');
+  
+  // Disconnect from signaling server
+  if (socket.current) {
+    socket.current.disconnect();
+    socket.current = null;
+  }
+  
+  // Close all peer connections with proper cleanup
+  const peerIds = Object.keys(peers.current);
+  console.log(`Cleaning up ${peerIds.length} peer connections`);
+  
+  peerIds.forEach(peerId => {
+    safeDestroyPeer(peerId);
+  });
+  
+  // Clear all references
+  peers.current = {};
+  dataChannels.current = {};
+  connectedPeers.current = {};
+  
+  // Clean up any pending requests
+  const pendingRequestIds = Object.keys(pendingRequests.current);
+  if (pendingRequestIds.length > 0) {
+    console.log(`Cleaning up ${pendingRequestIds.length} pending requests`);
+    pendingRequestIds.forEach(id => {
+      const request = pendingRequests.current[id];
+      if (request.reject) {
+        request.reject(new Error('Component unmounting'));
       }
     });
-    
-    // Clear all references
-    peers.current = {};
-    dataChannels.current = {};
-    connectedPeers.current = {};
-  };
+    pendingRequests.current = {};
+  }
+  
+  console.log('WebRTC cleanup completed');
+};
 }, [user, syncFolders, activeDevice.id]); // Include all dependencies used in the effect
 
-// Add this improved helper function to safely destroy peers
 const safeDestroyPeer = (peerId) => {
   try {
     const peer = peers.current[peerId];
@@ -347,33 +492,108 @@ const safeDestroyPeer = (peerId) => {
     
     console.log(`Attempting to safely destroy peer ${peerId}`);
     
-    // Check different possible structures of the peer object
+    // First, clean up any message handlers
+    if (peer.messageHandlers && typeof peer.messageHandlers.forEach === 'function') {
+      console.log(`Cleaning up ${peer.messageHandlers.size} message handlers for peer ${peerId}`);
+      peer.messageHandlers.forEach(handler => {
+        if (handler.timeoutId) {
+          clearTimeout(handler.timeoutId);
+        }
+      });
+      peer.messageHandlers.clear();
+    }
+    
+    // Clean up pending requests for this peer
+    const pendingRequestIds = Object.keys(pendingRequests.current).filter(
+      id => pendingRequests.current[id].peerId === peerId
+    );
+    
+    if (pendingRequestIds.length > 0) {
+      console.log(`Cleaning up ${pendingRequestIds.length} pending requests for peer ${peerId}`);
+      pendingRequestIds.forEach(id => {
+        const request = pendingRequests.current[id];
+        if (request.handlerId) {
+          // Since we're destroying the peer, we don't need to explicitly remove the handler
+          request.reject(new Error('Peer connection closed'));
+        }
+        delete pendingRequests.current[id];
+      });
+    }
+    
+    // Clean up any ICE connection event listeners
+    if (peer.peer && peer.peer._pc) {
+      const pc = peer.peer._pc;
+      
+      // Use a safer approach that doesn't require us to know the exact listeners
+      const eventTypes = [
+        'connectionstatechange',
+        'iceconnectionstatechange',
+        'icegatheringstatechange',
+        'negotiationneeded',
+        'signalingstatechange',
+        'track'
+      ];
+      
+      eventTypes.forEach(eventType => {
+        try {
+          // Get a clone of the event listeners if possible
+          const listeners = pc[`on${eventType}`] ? [pc[`on${eventType}`]] : [];
+          
+          // Replace with empty function
+          pc[`on${eventType}`] = null;
+          
+          // Try to use removeEventListener for each, though this may not work for all browsers
+          listeners.forEach(listener => {
+            try {
+              if (listener) pc.removeEventListener(eventType, listener);
+            } catch (e) {
+              // Ignore errors in cleanup
+            }
+          });
+        } catch (e) {
+          // Ignore errors in cleanup
+        }
+      });
+    }
+    
+    // Now destroy the peer object with the most appropriate method
     if (typeof peer.destroy === 'function') {
-      // If the peer wrapper has a destroy method
+      // If the peer wrapper has a destroy method (our standardized approach)
       console.log(`Using wrapper destroy() for peer ${peerId}`);
       peer.destroy();
     } else if (peer.peer && typeof peer.peer.destroy === 'function') {
       // If the peer has a nested peer object with destroy
       console.log(`Using peer.peer.destroy() for peer ${peerId}`);
       peer.peer.destroy();
-    } else if (typeof peer._destroy === 'function') {
-      // Some implementations might use _destroy
-      console.log(`Using _destroy() for peer ${peerId}`);
-      peer._destroy();
     } else {
-      // As a last resort, if we have a SimplePeer instance
+      // As a last resort
       console.log(`No standard destroy method found for peer ${peerId}`);
       
       // Try to close any data channels
       if (peer.dataChannel && peer.dataChannel.readyState === 'open') {
+        // Remove all data channel event listeners to prevent memory leaks
+        if (typeof peer.dataChannel.removeEventListener === 'function') {
+          try {
+            ['message', 'open', 'close', 'error'].forEach(eventType => {
+              // This removes all listeners but it's safe given we're destroying the peer
+              peer.dataChannel.removeEventListener(eventType, null);
+            });
+          } catch (e) {
+            // Ignore errors, just try to clean up
+          }
+        }
+        
         console.log(`Closing data channel for peer ${peerId}`);
         peer.dataChannel.close();
       }
       
-      // If it's a SimplePeer instance itself
-      if (peer._pc) {
-        console.log(`Closing peer connection directly for ${peerId}`);
-        peer._pc.close();
+      if (peer.peer && peer.peer._pc) {
+        try {
+          peer.peer._pc.close();
+        } catch (err) {
+          console.error(`Error closing peer._pc`, err);
+        }
+        peer.peer._pc = null;
       }
     }
     
@@ -384,6 +604,7 @@ const safeDestroyPeer = (peerId) => {
     }
     
     console.log(`Peer ${peerId} removed from tracking maps`);
+    return true;
   } catch (error) {
     console.error(`Error destroying peer ${peerId}:`, error);
     // Ensure we remove references even if an error occurs
@@ -391,76 +612,121 @@ const safeDestroyPeer = (peerId) => {
     if (connectedPeers.current[peerId]) {
       delete connectedPeers.current[peerId];
     }
+    return false;
   }
 };
   
-  const connectToSignalingServer = async () => {
-    return new Promise((resolve, reject) => {
-      try {
-        // Try to connect to the signaling server
-        console.log(`Connecting to signaling server at ${SIGNALING_SERVER}`);
+const connectToSignalingServer = async () => {
+  return new Promise((resolve, reject) => {
+    try {
+      // Try to connect to the signaling server
+      console.log(`Connecting to signaling server at ${SIGNALING_SERVER}`);
+      
+      const socketConnection = io(SIGNALING_SERVER, {
+        transports: ['websocket'],
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+        query: {
+          userId: user.uid,
+          deviceId: activeDevice.id
+        }
+      });
+      
+      // Set up event handlers
+      socketConnection.on('connect', () => {
+        console.log(`🟢 Connected to signaling server: ${socketConnection.id}`);
         
-        const socketConnection = io(SIGNALING_SERVER, {
-          transports: ['websocket'],
-          reconnection: true,
-          reconnectionAttempts: 5,
-          reconnectionDelay: 1000,
-          query: {
-            userId: user.uid,
-            deviceId: activeDevice.id
+        // Create the signaling interface
+        const signalingInterface = {
+          announce: (data) => {
+            console.log(`Announcing presence with folders:`, 
+                       data.folders.map(f => f.secretKey));
+            socketConnection.emit('announce', data);
+          },
+          on: (event, callback) => {
+            socketConnection.on(event, callback);
+          },
+          send: (to, data) => {
+            console.log(`Sending signal to ${to}, type: ${data.type || 'candidate'}`);
+            socketConnection.emit('signal', { to, signal: data });
+          },
+          networkId: socketConnection.id,
+          disconnect: () => {
+            // Clean up event listeners before disconnecting
+            ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
+              socketConnection.off(event);
+            });
+            socketConnection.disconnect();
+          },
+          // Add this to safely clean up event listeners
+          removeAllListeners: () => {
+            ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
+              socketConnection.off(event);
+            });
           }
-        });
+        };
         
-        // Set up event handlers
-        socketConnection.on('connect', () => {
-          console.log(`🟢 Connected to signaling server: ${socketConnection.id}`);
-          
-          // Create the signaling interface
-          const signalingInterface = {
-            announce: (data) => {
-              console.log(`Announcing presence with folders:`, 
-                         data.folders.map(f => f.secretKey));
-              socketConnection.emit('announce', data);
-            },
-            on: (event, callback) => {
-              socketConnection.on(event, callback);
-            },
-            send: (to, data) => {
-              console.log(`Sending signal to ${to}, type: ${data.type || 'candidate'}`);
-              socketConnection.emit('signal', { to, signal: data });
-            },
-            networkId: socketConnection.id,
-            disconnect: () => {
-              socketConnection.disconnect();
-            }
-          };
-          
-          resolve(signalingInterface);
-        });
-        
-        socketConnection.on('connect_error', (err) => {
-          console.error('Connection error:', err);
-          reject(err);
-        });
-        
-        socketConnection.on('connect_timeout', (err) => {
-          console.error('Connection timeout:', err);
+        resolve(signalingInterface);
+      });
+      
+      socketConnection.on('connect_error', (err) => {
+        console.error('Connection error:', err);
+        reject(err);
+      });
+      
+      socketConnection.on('connect_timeout', (err) => {
+        console.error('Connection timeout:', err);
+        reject(new Error('Connection timeout'));
+      });
+      
+      // Add connection monitoring for debugging
+      socketConnection.on('disconnect', (reason) => {
+        console.error(`Signaling server disconnected: ${reason}`);
+      });
+      
+      socketConnection.on('reconnect_attempt', (attemptNumber) => {
+        console.log(`Attempting to reconnect to signaling server (attempt ${attemptNumber})`);
+      });
+      
+      socketConnection.on('reconnect', (attemptNumber) => {
+        console.log(`Reconnected to signaling server after ${attemptNumber} attempts`);
+      });
+      
+      socketConnection.on('reconnect_error', (err) => {
+        console.error('Reconnection error:', err);
+      });
+      
+      socketConnection.on('reconnect_failed', () => {
+        console.error('Failed to reconnect to signaling server');
+      });
+      
+      // Add timeout for initial connection
+      const connectionTimeout = setTimeout(() => {
+        if (!socketConnection.connected) {
+          console.error('Connection to signaling server timed out');
+          socketConnection.close();
           reject(new Error('Connection timeout'));
-        });
-      } catch (error) {
-        console.error('Error connecting to signaling server:', error);
-        reject(error);
-      }
-    });
-  };
+        }
+      }, 10000);
+      
+      // Clear timeout when connected
+      socketConnection.on('connect', () => {
+        clearTimeout(connectionTimeout);
+      });
+      
+    } catch (error) {
+      console.error('Error connecting to signaling server:', error);
+      reject(error);
+    }
+  });
+};
 
-  // Create a WebRTC peer connection
 const createPeerConnection = async (peerId, initiator, signalingServer) => {
   return new Promise((resolve, reject) => {
     try {
       console.log(`📡 Creating peer connection to ${peerId}, initiator: ${initiator}`);
-      
-      // Create a new peer connection with robust options
+
       const peer = new SimplePeer({
         initiator,
         trickle: true,
@@ -469,251 +735,584 @@ const createPeerConnection = async (peerId, initiator, signalingServer) => {
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:global.stun.twilio.com:3478' }
           ]
-        },
-        // Reduced timeout settings for better reconnection
-        offerConstraints: {
-          offerToReceiveAudio: false,
-          offerToReceiveVideo: false
-        },
-        sdpTransform: (sdp) => {
-          // This ensures compatibility with more browsers
-          return sdp;
         }
       });
-      
-      // Debug listeners to track ICE connection state
-      peer._pc.addEventListener('iceconnectionstatechange', () => {
-        try {
-          // Check if peer._pc still exists before accessing it
-          if (peer && peer._pc) {
-            console.log(`🧊 ICE connection state for peer ${peerId}: ${peer._pc.iceConnectionState}`);
-            
-            if (peer._pc.iceConnectionState === 'disconnected' || 
-                peer._pc.iceConnectionState === 'failed' ||
-                peer._pc.iceConnectionState === 'closed') {
-              console.log(`ICE connection ${peer._pc.iceConnectionState} for peer ${peerId}`);
-            }
-          }
-        } catch (err) {
-          console.log(`Error accessing ICE connection state: ${err.message}`);
-        }
-      });
-      
-      peer._pc.addEventListener('icegatheringstatechange', () => {
-        console.log(`🧊 ICE gathering state for peer ${peerId}: ${peer._pc.iceGatheringState}`);
-      });
-      
-      // IMPORTANT: Create a preliminary wrapper and store immediately
-      // This ensures we can find the peer when signals arrive during connection
-      const preliminaryWrapper = {
-        peer,
-        status: 'connecting',
-        peerId
+
+      const preliminary = { 
+        peer, 
+        status: 'connecting', 
+        peerId,
+        messageHandlers: new Map() // Add map for custom message handlers
       };
-      
-      // Store immediately in peers.current
-      peers.current[peerId] = preliminaryWrapper;
-      console.log(`DEBUG: Stored preliminary peer ${peerId}. Current peers:`, Object.keys(peers.current));
-      
-      // Set up peer event handlers
-      peer.on('error', err => {
-        console.error(`❌ Peer connection error with ${peerId}:`, err);
-        
-        // Try to reconnect if this was an established connection
-        if (connectedPeers.current[peerId]) {
-          delete connectedPeers.current[peerId];
-          
-          // Update UI to reflect disconnection
-          setPeerNetworkState(prev => ({
-            ...prev,
-            peerCount: Object.keys(connectedPeers.current).length
-          }));
-          
-          reestablishPeerConnection(peerId, signalingServer)
-            .catch(e => console.error('Failed to reestablish connection:', e));
-        }
-      });
-      
+      peers.current[peerId] = preliminary;
+
       peer.on('signal', data => {
-        // Send signal data to peer via signaling server
-        console.log(`📤 Sending signal of type ${data.type || 'candidate'} to peer ${peerId}`);
+        console.log(`📤 Sending signal to ${peerId}: ${data.type || 'candidate'}`);
         signalingServer.send(peerId, data);
       });
-      
-      peer.on('connect', () => {
-        console.log(`🔗 Peer connection established with ${peerId}`);
-        
-        // Create data channel for file transfers
-        const dataChannel = peer._channel;
-        
-        // Add peerId to the dataChannel for reference
-        dataChannel.peerId = peerId;
-        
-        // Save the connection info
-        connectedPeers.current[peerId] = {
-          peer,
-          dataChannel,
-          status: 'connected',
-          connectedAt: new Date()
-        };
-        
-        // Create wrapper methods for easy data exchange
-        const peerConnectionWrapper = {
-          peer,
-          dataChannel,
-          send: (data) => {
-            const serializedData = JSON.stringify(data);
-            dataChannel.send(serializedData);
-            return true;
-          },
-          destroy: () => {
-            peer.destroy();
-            delete connectedPeers.current[peerId];
-            delete peers.current[peerId]; // Also remove from peers.current
-          },
-          requestFile: async (fileId, folderId, start, end) => {
-            return requestFileChunk(dataChannel, fileId, start, end, folderId);
-          }
-        };
 
-        peer._pc.addEventListener('iceconnectionstatechange', () => {
-          console.log(`🧊 ICE connection state for peer ${peerId}: ${peer._pc.iceConnectionState}`);
-          if (peer._pc.iceConnectionState === 'connected' || peer._pc.iceConnectionState === 'completed') {
-            console.log(`✅ ICE connection ESTABLISHED with peer ${peerId}`);
-          }
-        });
-        
-        // Replace the preliminary wrapper with the complete one
-        peers.current[peerId] = peerConnectionWrapper;
-        
-        console.log(`DEBUG: Updated peer ${peerId}. Current peers:`, Object.keys(peers.current));
-        
-        // Update the UI to show connected peers
-        setPeerNetworkState(prevState => {
-          const updatedState = {
-            ...prevState,
+      peer.on('connect', () => {
+        console.log(`Peer ${peerId} data channel established`);
+        const dataChannel = peer._channel;
+        dataChannel.peerId = peerId;
+
+        // Add a small delay before considering the connection ready
+        // This gives the data channel time to fully stabilize
+        setTimeout(() => {
+          console.log(`Creating peer wrapper for ${peerId} after connection stabilization`);
+          
+          const peerWrapper = {
+            peer,
+            dataChannel,
+            status: 'connected',
+            messageHandlers: new Map(), // Track message handlers
+            peerId,
+            isInitiator: initiator,
+            connectionTime: Date.now(),
+            
+            // In createPeerConnection, update the peerWrapper.send method:
+send: msg => {
+  try {
+    // Make extra sure we have a valid dataChannel
+    if (!dataChannel) {
+      console.warn(`Data channel is null for peer ${peerId}`);
+      return false;
+    }
+    
+    // Multiple readyState checks
+    if (dataChannel.readyState !== 'open') {
+      console.warn(`Data channel not open for peer ${peerId}. State: ${dataChannel.readyState}`);
+      return false;
+    }
+    
+    // Check the peer object isn't destroyed
+    if (peer._destroyed) {
+      console.warn(`Cannot send - peer ${peerId} is destroyed`);
+      return false;
+    }
+    
+    const jsonStr = JSON.stringify(msg);
+    
+    // One more check right before sending
+    if (dataChannel.readyState === 'open') {
+      dataChannel.send(jsonStr);
+      return true;
+    } else {
+      console.warn(`Data channel state changed to ${dataChannel.readyState} before sending`);
+      return false;
+    }
+  } catch (err) {
+    console.error(`❌ Failed to send to ${peerId}`, err, err.stack);
+    return false;
+  }
+},
+            
+            // Send binary data
+            sendBinary: data => {
+              try {
+                if (!dataChannel || dataChannel.readyState !== 'open') {
+                  console.warn(`Data channel not open for peer ${peerId}. State: ${dataChannel?.readyState || 'undefined'}`);
+                  return false;
+                }
+                
+                dataChannel.send(data);
+                return true;
+              } catch (err) {
+                console.error(`❌ Failed to send binary data to ${peerId}`, err);
+                return false;
+              }
+            },
+            
+            // Add a message handler for a specific type with optional timeout
+            addMessageHandler: (messageType, handler, timeout = 30000) => {
+              const handlerId = `${messageType}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+              
+              const handlerInfo = {
+                id: handlerId,
+                type: messageType,
+                handler,
+                timestamp: Date.now()
+              };
+              
+              // Set timeout to auto-remove handler if specified
+              if (timeout > 0) {
+                handlerInfo.timeoutId = setTimeout(() => {
+                  if (peerWrapper.messageHandlers) {
+                    peerWrapper.messageHandlers.delete(handlerId);
+                    console.log(`🕒 Timed out and removed message handler ${handlerId} for ${messageType}`);
+                  }
+                }, timeout);
+              }
+              
+              peerWrapper.messageHandlers.set(handlerId, handlerInfo);
+              console.log(`➕ Added message handler ${handlerId} for ${messageType}`);
+              return handlerId;
+            },
+            
+            // Remove a specific message handler by ID
+            removeMessageHandler: (handlerId) => {
+              if (!peerWrapper.messageHandlers) return false;
+              
+              const handlerInfo = peerWrapper.messageHandlers.get(handlerId);
+              if (handlerInfo) {
+                if (handlerInfo.timeoutId) {
+                  clearTimeout(handlerInfo.timeoutId);
+                }
+                peerWrapper.messageHandlers.delete(handlerId);
+                console.log(`➖ Removed message handler ${handlerId}`);
+                return true;
+              }
+              return false;
+            },
+            
+            // Clear all message handlers
+            clearMessageHandlers: () => {
+              if (!peerWrapper.messageHandlers) return;
+              
+              peerWrapper.messageHandlers.forEach(handler => {
+                if (handler.timeoutId) {
+                  clearTimeout(handler.timeoutId);
+                }
+              });
+              peerWrapper.messageHandlers.clear();
+              console.log(`🧹 Cleared all message handlers for peer ${peerId}`);
+            },
+            
+            destroy: (reason = "explicit destroy call") => {
+              console.log(`Destroying peer ${peerId}, reason: ${reason}`);
+              console.trace("Destroy call stack trace");
+              
+              // Clear all message handlers before destroying
+              peerWrapper.clearMessageHandlers();
+              
+              // Make sure we don't have circular references
+              if (peer && !peer._destroyed) {
+                peer.destroy();
+              }
+              
+              // Remove from tracking maps
+              delete peers.current[peerId];
+              delete connectedPeers.current[peerId];
+              
+              console.log(`Peer ${peerId} destroyed and removed from tracking`);
+            },
+            
+            requestFile: (fileId, folderId, start, end) =>
+              requestFileChunk(peerWrapper, fileId, start, end, folderId)
+          };
+
+          // Store the wrapper in our maps
+          connectedPeers.current[peerId] = peerWrapper;
+          peers.current[peerId] = peerWrapper;
+
+          // Log peer tracking maps state
+          console.log(`Peer tracking state after connection:`, {
+            inPeersMap: !!peers.current[peerId],
+            inConnectedPeers: !!connectedPeers.current[peerId],
+            peersCount: Object.keys(peers.current).length,
+            connectedCount: Object.keys(connectedPeers.current).length
+          });
+
+          setPeerNetworkState(prev => ({
+            ...prev,
             connected: true,
             peerCount: Object.keys(connectedPeers.current).length
-          };
-          console.log(`Updated peer state: ${JSON.stringify(updatedState)}`);
-          return updatedState;
-        });
-        
-        console.log(`Total connected peers: ${Object.keys(connectedPeers.current).length}`);
-        
-        // Test the connection with a ping
-        try {
-          console.log(`📤 Sending ping to peer ${peerId}`);
-          dataChannel.send(JSON.stringify({
-            type: 'PING',
-            data: { timestamp: Date.now() }
           }));
-        } catch (err) {
-          console.error('Error sending ping:', err);
-        }
-        
-        resolve(peerConnectionWrapper);
+
+          console.log(`🔗 Connected to ${peerId}`);
+          
+          // Additional check before sending first message
+          // if (dataChannel && dataChannel.readyState === 'open') {
+          //   console.log(`Sending initial PING to ${peerId}`);
+          //   peerWrapper.send({ type: 'PING', data: { timestamp: Date.now() } });
+          // } else {
+          //   console.warn(`Not sending initial PING - data channel not ready: ${dataChannel?.readyState || 'undefined'}`);
+          // }
+
+          peerWrapper.isReady = true;
+
+          resolve(peerWrapper);
+          console.log(`Peer connection setup completed for ${peerId}`);
+        }, 100); // 100ms delay to ensure data channel is ready
       });
-      
-      // Handle incoming data with better error handling
-      peer.on('data', data => {
+
+      peer.on('data', raw => {
         try {
-          // Log for debugging
-          console.log(`📥 Received data from peer ${peerId}, type: ${typeof data}, size: ${typeof data === 'string' ? data.length : data.byteLength || 'unknown'} bytes`);
-          
-          // Check if it's binary data
-          if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
-            handleBinaryData(data, peerId);
-            return;
-          }
-          
-          // Try to parse as JSON if it's a string
-          if (typeof data === 'string') {
+          // Parse the data - handle both string and binary formats
+          if (raw instanceof ArrayBuffer || raw instanceof Uint8Array) {
             try {
-              const message = JSON.parse(data);
-              handlePeerMessage(message, peerId);
+              // Try to decode as text and parse as JSON
+              const text = new TextDecoder().decode(raw);
+              try {
+                const message = JSON.parse(text);
+                console.log(`📩 Received message from ${peerId}, type: ${message.type}`);
+                
+                // Process the message through handlers or default handler
+                const peerObj = peers.current[peerId];
+                let handled = false;
+                
+                if (peerObj && peerObj.messageHandlers && peerObj.messageHandlers.size > 0) {
+                  // Create an array of handlers to avoid modification during iteration
+                  const handlers = Array.from(peerObj.messageHandlers.values());
+                  
+                  for (const handlerInfo of handlers) {
+                    if (handlerInfo.type === message.type) {
+                      try {
+                        // Call the handler
+                        handled = handlerInfo.handler(message) || handled;
+                        
+                        // If this is a one-time handler, remove it after successful execution
+                        if (handlerInfo.oneTime) {
+                          peerObj.removeMessageHandler(handlerInfo.id);
+                        }
+                      } catch (err) {
+                        console.error(`Error in message handler for ${message.type}:`, err);
+                      }
+                    }
+                  }
+                }
+                
+                // If no custom handler processed this message, use the default handler
+                if (!handled) {
+                  handlePeerMessage(message, peerId);
+                }
+              } catch (e) {
+                // If JSON parsing fails, treat as binary data
+                handleBinaryData(raw, peerId);
+              }
             } catch (e) {
-              console.error(`Error parsing JSON from peer ${peerId}:`, e);
-              console.log(`Raw data:`, data.slice(0, 100) + '...'); // Show first 100 chars
+              // If decoding fails, this is definitely binary data
+              handleBinaryData(raw, peerId);
+            }
+          } else if (typeof raw === 'string') {
+            // Parse string as JSON
+            try {
+              const message = JSON.parse(raw);
+              console.log(`📩 Received string message from ${peerId}, type: ${message.type}`);
+              
+              // Process with handlers or default handler (same logic as above)
+              const peerObj = peers.current[peerId];
+              let handled = false;
+              
+              if (peerObj && peerObj.messageHandlers && peerObj.messageHandlers.size > 0) {
+                const handlers = Array.from(peerObj.messageHandlers.values());
+                
+                for (const handlerInfo of handlers) {
+                  if (handlerInfo.type === message.type) {
+                    try {
+                      handled = handlerInfo.handler(message) || handled;
+                      
+                      if (handlerInfo.oneTime) {
+                        peerObj.removeMessageHandler(handlerInfo.id);
+                      }
+                    } catch (err) {
+                      console.error(`Error in message handler for ${message.type}:`, err);
+                    }
+                  }
+                }
+              }
+              
+              if (!handled) {
+                handlePeerMessage(message, peerId);
+              }
+            } catch (err) {
+              console.error(`Failed to parse JSON message from ${peerId}:`, err);
             }
           } else {
-            // If already an object (not a string), pass it directly
-            handlePeerMessage(data, peerId);
+            console.error(`Received unexpected data type from ${peerId}`);
           }
-        } catch (error) {
-          console.error(`Error in data handler for peer ${peerId}:`, error);
+        } catch (err) {
+          console.error(`❌ Failed to handle data from ${peerId}`, err);
         }
       });
+
+      peer.on('error', err => {
+        console.error(`❌ Peer error with ${peerId}:`, err);
+        console.log(`Error stack:`, err.stack);
+        
+        // Update status in peer object
+        if (peers.current[peerId]) {
+          peers.current[peerId].status = 'error';
+          
+          // Clean up message handlers
+          if (peers.current[peerId].messageHandlers) {
+            peers.current[peerId].messageHandlers.forEach(handler => {
+              if (handler.timeoutId) {
+                clearTimeout(handler.timeoutId);
+              }
+            });
+            peers.current[peerId].messageHandlers.clear();
+          }
+        }
+        
+        delete connectedPeers.current[peerId];
+        
+        setPeerNetworkState(prev => ({
+          ...prev,
+          peerCount: Object.keys(connectedPeers.current).length
+        }));
+        
+        // Only attempt to reconnect if we're still online and connected to signaling server
+        if (socket.current && socket.current.networkId) {
+          // Use our improved reconnection logic
+          reestablishPeerConnection(peerId, signalingServer).catch(reconnectError => {
+            console.error(`Failed to reestablish connection after error:`, reconnectError);
+          });
+        } else {
+          console.log(`Not attempting to reconnect to ${peerId} - no signaling connection`);
+        }
+      });
+
+      peer.on('close', () => {
+        console.log(`🔌 Peer closed: ${peerId}`);
+        console.log(`Peer state at close:`, {
+          inPeersMap: !!peers.current[peerId],
+          inConnectedPeers: !!connectedPeers.current[peerId],
+          hasMessageHandlers: !!(peers.current[peerId]?.messageHandlers),
+          peerDestroyed: peer._destroyed || false,
+          peerStatus: peers.current[peerId]?.status || 'unknown'
+        });
+        console.trace("Peer close stack trace");
+        
+        // Clean up message handlers
+        if (peers.current[peerId] && peers.current[peerId].messageHandlers) {
+          peers.current[peerId].messageHandlers.forEach(handler => {
+            if (handler.timeoutId) {
+              clearTimeout(handler.timeoutId);
+            }
+          });
+          
+          peers.current[peerId].messageHandlers.clear();
+        }
+        
+        // Clean up references
+        delete connectedPeers.current[peerId];
+        delete peers.current[peerId];
+        
+        setPeerNetworkState(prev => ({
+          ...prev,
+          peerCount: Object.keys(connectedPeers.current).length
+        }));
+      });
+
+      // Advanced connection state monitoring
+      peer._pc?.addEventListener?.('connectionstatechange', () => {
+        const state = peer._pc?.connectionState;
+        console.log(`🌐 Peer ${peerId} connection state:`, state);
+        
+        // Log detailed connection state
+        console.log(`Peer state detail at ${state}:`, {
+          peerInMap: !!peers.current[peerId],
+          peerInConnected: !!connectedPeers.current[peerId],
+          hasDataChannel: !!(peer._channel),
+          dataChannelState: peer._channel ? peer._channel.readyState : 'none',
+          peerDestroyed: peer._destroyed || false,
+          socketConnected: !!(socket.current?.networkId)
+        });
       
-      // Add this to your createPeerConnection function
-peer.on('close', () => {
-  console.log(`🔌 Peer connection closed: ${peerId}`);
-  
-  if (connectedPeers.current[peerId]) {
-    delete connectedPeers.current[peerId];
-  }
-  
-  // Also delete from peers.current
-  delete peers.current[peerId];
-  
-  // Update peer count
-  setPeerNetworkState(prev => ({
-    ...prev,
-    peerCount: Object.keys(connectedPeers.current).length
-  }));
-});
+        if (state === 'connected') {
+          console.log(`🎉 WebRTC fully connected to ${peerId}`);
+        }
       
-      // If this is a receiver (not initiator), resolve immediately
-      // This ensures we can handle signals during connection setup
-      if (!initiator) {
-        resolve(preliminaryWrapper);
-      }
+        if (state === 'disconnected' || state === 'failed') {
+          console.warn(`⚠️ Connection lost to ${peerId}, cleaning up`);
+          console.trace("Connection loss stack trace");
+          safeDestroyPeer(peerId, `connectionstate: ${state}`);
+        }
+      });
+
+      peer._pc?.addEventListener?.('iceconnectionstatechange', () => {
+        const state = peer._pc?.iceConnectionState;
+        console.log(`🧊 ICE state for ${peerId}:`, state);
+        
+        if (state === 'connected' || state === 'completed') {
+          console.log(`✅ ICE connected with peer ${peerId}`);
+        }
       
+        if (state === 'failed') {
+          console.warn(`❌ ICE failed for ${peerId}, attempting reconnect`);
+          console.trace("ICE failure stack trace");
+          
+          // Clean up properly before reconnection attempt
+          safeDestroyPeer(peerId, `ICE failed state: ${state}`);
+          
+          // Now try to reconnect
+          reestablishPeerConnection(peerId, signalingServer).catch(error => {
+            console.error(`Error reestablishing connection:`, error);
+          });
+        }
+      });
+
+      // If not initiator, resolve with preliminary object
+      if (!initiator) resolve(preliminary);
     } catch (error) {
-      console.error('Error creating peer connection:', error);
+      console.error('❌ Failed to create peer:', error);
       reject(error);
     }
   });
 };
   
-  // Reestablish a peer connection
-  const reestablishPeerConnection = async (peerId, signalingServer) => {
-    try {
-      console.log(`🔄 Attempting to reestablish connection with peer ${peerId}`);
+// Reestablish a peer connection with proper initiator logic and exponential backoff
+const reestablishPeerConnection = async (peerId, signalingServer) => {
+  try {
+    // Get the current time to track when this reconnection attempt started
+    const reconnectStartTime = Date.now();
+    console.log(`🔄 Attempting to reestablish connection with peer ${peerId}`);
+    
+    // Check if peer exists already
+    if (peers.current[peerId] && peers.current[peerId].status === 'connected') {
+      console.log(`Peer ${peerId} is already connected, no need to reestablish`);
+      return peers.current[peerId];
+    }
+    
+    // Use our deterministic logic to decide who should be the initiator
+    const yourId = signalingServer.networkId;
+    const shouldBeInitiator = yourId.localeCompare(peerId) > 0;
+    
+    console.log(`Should be initiator for reconnection to ${peerId}? ${shouldBeInitiator}`);
+    
+    // If we should be initiator, attempt to create a new connection
+    if (shouldBeInitiator) {
+      // First, ensure any existing connection is properly cleaned up
+      if (peers.current[peerId]) {
+        console.log(`Cleaning up existing peer ${peerId} before reconnection`);
+        await safeDestroyPeer(peerId);
+        
+        // Small delay to ensure cleanup is complete
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      // Create a preliminary connection state
+      peers.current[peerId] = {
+        status: 'reconnecting',
+        peerId,
+        isInitiator: true,
+        connectionAttemptTime: reconnectStartTime,
+        reconnectAttempts: (peers.current[peerId]?.reconnectAttempts || 0) + 1
+      };
+      
+      // Calculate backoff time based on number of attempts (exponential backoff)
+      const attempts = peers.current[peerId].reconnectAttempts;
+      const backoffTime = Math.min(Math.pow(2, attempts - 1) * 1000, 10000); // Cap at 10 seconds
+      
+      if (backoffTime > 0) {
+        console.log(`Using exponential backoff: waiting ${backoffTime}ms before reconnection attempt #${attempts}`);
+        await new Promise(resolve => setTimeout(resolve, backoffTime));
+        
+        // Check if another reconnection has been started in the meantime
+        if (peers.current[peerId]?.connectionAttemptTime !== reconnectStartTime) {
+          console.log(`A newer reconnection attempt for ${peerId} has started, aborting this one`);
+          return null;
+        }
+      }
       
       // Create a new peer connection as initiator
-      const peerConnection = await createPeerConnection(peerId, true, signalingServer);
+      console.log(`Creating new initiator connection to ${peerId} (attempt #${attempts})`);
       
-      // Update our tracked peers
-      peers.current[peerId] = peerConnection;
-      
-      return peerConnection;
-    } catch (error) {
-      console.error('Failed to reestablish peer connection:', error);
-      throw error;
-    }
-  };
-  
-  const handlePeerMessage = (message, peerId) => {
-    console.log(`Handle message from peer ${peerId}, type: ${message.type}`);
-    
-    const { type, data } = message;
-    
-    switch (type) {
-      case 'PING':
-        console.log(`Received PING from peer ${peerId}, sending PONG`);
-        sendPeerMessage(peerId, {
-          type: 'PONG',
-          data: { 
-            timestamp: Date.now(),
-            original: data.timestamp 
-          }
-        });
-        break;
+      try {
+        const peerConnection = await createPeerConnection(peerId, true, signalingServer);
         
-      case 'PONG':
-        console.log(`Received PONG from peer ${peerId}, round-trip: ${Date.now() - data.timestamp}ms`);
-        break;
+        // Update our tracked peers if this is still the most recent attempt
+        if (peers.current[peerId]?.connectionAttemptTime === reconnectStartTime) {
+          peers.current[peerId] = {
+            ...peerConnection,
+            isInitiator: true,
+            reconnectAttempts: attempts,
+            connectionAttemptTime: reconnectStartTime
+          };
+          
+          return peerConnection;
+        } else {
+          // A newer attempt has taken precedence, destroy this connection
+          console.log(`A newer reconnection attempt for ${peerId} has taken precedence`);
+          if (peerConnection.destroy) peerConnection.destroy();
+          else if (peerConnection.peer && peerConnection.peer.destroy) peerConnection.peer.destroy();
+          return null;
+        }
+      } catch (error) {
+        console.error(`Failed to create new connection to ${peerId}:`, error);
+        
+        // Mark this connection attempt as failed
+        if (peers.current[peerId]?.connectionAttemptTime === reconnectStartTime) {
+          peers.current[peerId].status = 'error';
+        }
+        
+        // Schedule another attempt, but only if we haven't exceeded maximum attempts
+        if (attempts < 5) {
+          console.log(`Scheduling another reconnection attempt for ${peerId}`);
+          
+          // Use setTimeout to avoid blocking
+          setTimeout(() => {
+            reestablishPeerConnection(peerId, signalingServer)
+              .catch(err => console.error(`Subsequent reconnection attempt failed:`, err));
+          }, backoffTime * 2);
+        } else {
+          console.log(`Maximum reconnection attempts (5) reached for peer ${peerId}`);
+        }
+        
+        throw error;
+      }
+    } else {
+      // If we should NOT be the initiator, set up a state to wait for the other peer to connect
+      console.log(`Not initiator for ${peerId}, setting state to await connection`);
+      
+      // Clean up any existing error state connection
+      if (peers.current[peerId] && peers.current[peerId].status === 'error') {
+        await safeDestroyPeer(peerId);
+      }
+      
+      // Set state to awaiting connection from the other peer
+      peers.current[peerId] = {
+        status: 'awaiting_offer',
+        peerId,
+        isInitiator: false,
+        connectionAttemptTime: reconnectStartTime
+      };
+      
+      // Return null since we're not creating the connection
+      return null;
+    }
+  } catch (error) {
+    console.error(`Failed to reestablish peer connection with ${peerId}:`, error);
+    throw error;
+  }
+};
+  
+const handlePeerMessage = (message, peerId) => {
+  console.log(`Handle message from peer ${peerId}, type: ${message.type}`);
+  
+  const { type, data } = message;
+  
+  const peer = connectedPeers.current[peerId];
+  if (!peer) {
+    console.log(`Cannot handle message from ${peerId}: peer not found in connectedPeers`);
+    return;
+  }
+  
+  switch (type) {
+    case 'PING':
+      console.log(`Received PING from peer ${peerId}, sending PONG`);
+      // Add a small delay before responding to avoid race conditions
+      setTimeout(() => {
+        if (connectedPeers.current[peerId]) {
+          const success = peer.send({
+            type: 'PONG',
+            data: { 
+              timestamp: Date.now(),
+              original: data.timestamp 
+            }
+          });
+          
+          if (!success) {
+            console.warn(`Failed to send PONG to ${peerId}`);
+          }
+        }
+      }, 50);
+      break;
+      
+    case 'PONG':
+      console.log(`Received PONG from peer ${peerId}, round-trip: ${Date.now() - data.timestamp}ms`);
+      break;
         
       case 'FILE_REQUEST':
         // Another peer is requesting a file chunk from us
@@ -806,107 +1405,132 @@ peer.on('close', () => {
     }
   };
   
-  // Handle binary data (file chunks) from peers
-  const handleBinaryData = (data, peerId) => {
-    console.log(`📦 Received binary data from peer ${peerId}, size: ${data.byteLength || 'unknown'} bytes`);
-    
-    // Check if this is for a pending file request
-    const pendingReq = Object.values(pendingRequests.current).find(
-      req => req.peerId === peerId && req.status === 'waiting'
-    );
-    
-    if (pendingReq) {
-      console.log(`Found matching pending request for binary data: ${pendingReq.id}`);
-      // This is data for a pending request
-      pendingReq.status = 'received';
-      pendingReq.data = data;
-      pendingReq.resolve(data);
-    } else {
-      console.log('Received unexpected binary data from peer:', peerId);
-    }
-  };
+// Handle binary data (file chunks) from peers
+const handleBinaryData = (data, peerId) => {
+  console.log(`📦 Received binary data from peer ${peerId}, size: ${data.byteLength || 'unknown'} bytes`);
   
-  // Handle file request from a peer
-  const handleFileRequest = async (request, peerId) => {
-    const { fileId, folderId, chunkStart, chunkEnd, requestId } = request;
+  // Find the corresponding pending request
+  const pendingRequest = Object.values(pendingRequests.current).find(
+    req => req.peerId === peerId && req.status === 'pending'
+  );
+  
+  if (pendingRequest) {
+    console.log(`Found matching pending request for binary data: ${pendingRequest.id}`);
     
-    try {
-      // Find the folder and file
-      const folder = syncFolders.find(f => f.id === folderId);
-      if (!folder) {
-        sendPeerMessage(peerId, {
-          type: 'FILE_RESPONSE',
-          data: {
-            requestId,
-            error: 'Folder not found'
-          }
-        });
-        return;
-      }
-      
-      const file = folder.files.find(f => f.id === fileId);
-      if (!file) {
-        sendPeerMessage(peerId, {
-          type: 'FILE_RESPONSE',
-          data: {
-            requestId,
-            error: 'File not found'
-          }
-        });
-        return;
-      }
-      
-      // Check if we have the file locally
-      if (!file.url) {
-        sendPeerMessage(peerId, {
-          type: 'FILE_RESPONSE',
-          data: {
-            requestId,
-            error: 'File not available locally'
-          }
-        });
-        return;
-      }
-      
-      // Fetch the file data
-      const response = await fetch(file.url);
-      const fileData = await response.arrayBuffer();
-      
-      // Get the requested chunk
-      const chunk = fileData.slice(chunkStart, chunkEnd);
-      
-      // Send response with chunk data
+    // Update the request
+    pendingRequest.status = 'received';
+    pendingRequest.data = data;
+    
+    // Remove the message handler
+    const peerObj = peers.current[peerId];
+    if (peerObj && peerObj.removeMessageHandler && pendingRequest.handlerId) {
+      peerObj.removeMessageHandler(pendingRequest.handlerId);
+    }
+    
+    // Resolve the promise
+    pendingRequest.resolve(data);
+  } else {
+    console.log('Received unexpected binary data from peer:', peerId);
+  }
+};
+  
+// Handle file request from a peer
+const handleFileRequest = async (request, peerId) => {
+  const { fileId, folderId, chunkStart, chunkEnd, requestId } = request;
+  
+  try {
+    // Find the folder and file
+    const folder = syncFolders.find(f => f.id === folderId);
+    if (!folder) {
       sendPeerMessage(peerId, {
         type: 'FILE_RESPONSE',
         data: {
           requestId,
-          fileId,
-          folderId,
-          chunkStart,
-          chunkEnd,
-          totalSize: fileData.byteLength,
-          success: true
+          error: 'Folder not found'
         }
       });
-      
-      // Send the binary data directly
-      const peer = connectedPeers.current[peerId];
-      if (peer && peer.dataChannel && peer.dataChannel.readyState === 'open') {
-        peer.dataChannel.send(new Uint8Array(chunk));
-      }
-    } catch (error) {
-      console.error('Error handling file request:', error);
-      
-      // Send error response
+      return;
+    }
+    
+    const file = folder.files.find(f => f.id === fileId);
+    if (!file) {
       sendPeerMessage(peerId, {
         type: 'FILE_RESPONSE',
         data: {
           requestId,
-          error: error.message
+          error: 'File not found'
+        }
+      });
+      return;
+    }
+    
+    // Check if we have the file locally
+    if (!file.url) {
+      sendPeerMessage(peerId, {
+        type: 'FILE_RESPONSE',
+        data: {
+          requestId,
+          error: 'File not available locally'
+        }
+      });
+      return;
+    }
+    
+    // Fetch the file data
+    const response = await fetch(file.url);
+    const fileData = await response.arrayBuffer();
+    
+    // Get the requested chunk
+    const chunk = fileData.slice(chunkStart, chunkEnd);
+    
+    // Send response with chunk metadata
+    sendPeerMessage(peerId, {
+      type: 'FILE_RESPONSE',
+      data: {
+        requestId,
+        fileId,
+        folderId,
+        chunkStart,
+        chunkEnd,
+        totalSize: fileData.byteLength,
+        success: true
+      }
+    });
+    
+    // Wait a small amount of time to ensure the FILE_RESPONSE is processed first
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    // Send the binary data directly
+    const peer = connectedPeers.current[peerId];
+    if (peer && peer.sendBinary) {
+      // Use our enhanced sendBinary method
+      peer.sendBinary(new Uint8Array(chunk));
+    } else if (peer && peer.dataChannel && peer.dataChannel.readyState === 'open') {
+      // Fallback to direct data channel send
+      peer.dataChannel.send(new Uint8Array(chunk));
+    } else {
+      console.error(`Unable to send binary data to peer ${peerId}`);
+      sendPeerMessage(peerId, {
+        type: 'FILE_RESPONSE',
+        data: {
+          requestId,
+          error: 'Failed to send binary data'
         }
       });
     }
-  };
+  } catch (error) {
+    console.error('Error handling file request:', error);
+    
+    // Send error response
+    sendPeerMessage(peerId, {
+      type: 'FILE_RESPONSE',
+      data: {
+        requestId,
+        error: error.message
+      }
+    });
+  }
+};
   
   // Handle file response from a peer
   const handleFileResponse = (response) => {
@@ -1041,28 +1665,40 @@ peer.on('close', () => {
     }
   };
   
-  // Send a message to a specific peer
-  const sendPeerMessage = (peerId, message) => {
-    const peer = connectedPeers.current[peerId];
-    if (!peer || !peer.dataChannel) {
-      console.error(`❌ Unable to send message to peer: ${peerId} - No data channel`);
-      return false;
-    }
+// Send a message to a specific peer
+const sendPeerMessage = (peerId, message) => {
+  const peer = connectedPeers.current[peerId];
+  if (!peer) {
+    console.error(`❌ Unable to send message to peer: ${peerId} - No peer connection`);
+    return false;
+  }
+  
+  if (!peer.dataChannel) {
+    console.error(`❌ Unable to send message to peer: ${peerId} - No data channel`);
+    return false;
+  }
+  
+  if (peer.dataChannel.readyState !== 'open') {
+    console.error(`❌ Data channel not open for peer ${peerId}. State: ${peer.dataChannel.readyState}`);
+    return false;
+  }
+  
+  try {
+    console.log(`📤 Sending message to peer ${peerId}:`, message.type);
     
-    if (peer.dataChannel.readyState !== 'open') {
-      console.error(`❌ Data channel not open for peer ${peerId}. State: ${peer.dataChannel.readyState}`);
-      return false;
-    }
-    
-    try {
-      console.log(`📤 Sending message to peer ${peerId}:`, message.type);
+    // Use the safer send method
+    if (peer.send) {
+      return peer.send(message);
+    } else {
+      // Fallback to direct dataChannel send
       peer.dataChannel.send(JSON.stringify(message));
       return true;
-    } catch (error) {
-      console.error('Error sending message to peer:', error);
-      return false;
     }
-  };
+  } catch (error) {
+    console.error('Error sending message to peer:', error);
+    return false;
+  }
+};
 
   // Broadcast folder added by key to other tabs
 const broadcastFolderAddedByKey = (folder, files) => {
@@ -1111,13 +1747,38 @@ const broadcastFolderAddedByKey = (folder, files) => {
     return successCount;
   };
   
-  // Request a file chunk from a peer
-  const requestFileChunk = async (dataChannel, fileId, chunkStart, chunkEnd, folderId) => {
-    return new Promise((resolve, reject) => {
-      // Generate a unique request ID
-      const requestId = 'req_' + Math.random().toString(36).substr(2, 9);
+// Request a file chunk from a peer
+const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folderId) => {
+  return new Promise((resolve, reject) => {
+    // Generate a unique request ID
+    const requestId = 'req_' + Math.random().toString(36).substr(2, 9);
+    let handlerId = null; // Define handlerId variable here
+    
+    // Send the request
+    try {
+      // Add a handler for the FILE_RESPONSE message
+      handlerId = peerWrapper.addMessageHandler('FILE_RESPONSE', (message) => {
+        if (message.data && message.data.requestId === requestId) {
+          const { error, success } = message.data;
+          
+          if (error) {
+            // The request failed
+            peerWrapper.removeMessageHandler(handlerId);
+            reject(new Error(error));
+            return true; // Mark as handled
+          } else if (success) {
+            // The chunk data will come separately as binary data
+            console.log(`Received FILE_RESPONSE success for ${requestId}, awaiting binary chunk`);
+            
+            // We'll now wait for the binary data
+            // The listener stays active until timeout or we get binary data in handleBinaryData
+            return true; // Mark as handled
+          }
+        }
+        return false; // Not handled
+      }, 30000); // 30 second timeout
       
-      // Store this request
+      // Store this request so we can match binary data to it
       pendingRequests.current[requestId] = {
         id: requestId,
         fileId,
@@ -1126,199 +1787,201 @@ const broadcastFolderAddedByKey = (folder, files) => {
         chunkEnd,
         status: 'pending',
         createdAt: new Date(),
-        peerId: dataChannel.peerId, // Assuming we added peerId to the dataChannel
+        peerId: peerWrapper.peerId,
         resolve,
-        reject
+        reject,
+        handlerId
       };
       
-      // Set a timeout for this request
-      const timeout = setTimeout(() => {
-        if (pendingRequests.current[requestId] && 
-            pendingRequests.current[requestId].status !== 'received') {
-          pendingRequests.current[requestId].status = 'timeout';
-          pendingRequests.current[requestId].reject(new Error('Request timed out'));
-          delete pendingRequests.current[requestId];
+      // Send the request message
+      peerWrapper.send({
+        type: 'FILE_REQUEST',
+        data: {
+          requestId,
+          fileId,
+          folderId,
+          chunkStart,
+          chunkEnd
         }
-      }, 30000); // 30 second timeout
-      
-      // Send the request
-      try {
-        dataChannel.send(JSON.stringify({
-          type: 'FILE_REQUEST',
-          data: {
-            requestId,
-            fileId,
-            folderId,
-            chunkStart,
-            chunkEnd
-          }
-        }));
-      } catch (error) {
-        clearTimeout(timeout);
-        delete pendingRequests.current[requestId];
-        reject(error);
-      }
-    });
-  };
-  
-  // Download a file from peers
-  const downloadFileFromPeers = async (file, folder) => {
-    // Check if the file is already available locally
-    if (file.synced && file.url) {
-      return file;
-    }
-    
-    // Check if we have peers that have this file
-    if (!file.availableFrom || file.availableFrom.length === 0) {
-      throw new Error('No peers have this file');
-    }
-    
-    // Use the first available peer
-    const peerId = file.availableFrom[0];
-    const peer = connectedPeers.current[peerId];
-    
-    if (!peer) {
-      throw new Error('Peer connection not available');
-    }
-    
-    // Start the download process
-    try {
-      // Show progress in UI
-      setDownloadProgress({
-        fileId: file.id,
-        progress: 0,
-        status: 'starting'
       });
-      
-      // Request file metadata first
-      const metadataResponse = await peer.requestFile(file.id, folder.id, 0, 0);
-      
-      // The response should include the total file size
-      const totalSize = metadataResponse.totalSize || file.size;
-      const chunks = Math.ceil(totalSize / chunkSize);
-      const fileChunks = new Array(chunks);
-      
-      // Initialize array buffer to store the full file
-      const fileData = new Uint8Array(totalSize);
-      
-      // Download the chunks
-      let downloaded = 0;
-      const concurrentRequests = 3; // Number of chunks to download concurrently
-      
-      // Process chunks in batches
-      for (let i = 0; i < chunks; i += concurrentRequests) {
-        const chunkPromises = [];
-        
-        // Create promises for concurrent chunk downloads
-        for (let j = 0; j < concurrentRequests && i + j < chunks; j++) {
-          const chunkIndex = i + j;
-          const chunkStart = chunkIndex * chunkSize;
-          const chunkEnd = Math.min(chunkStart + chunkSize, totalSize);
-          
-          chunkPromises.push(
-            peer.requestFile(file.id, folder.id, chunkStart, chunkEnd)
-              .then(chunkData => {
-                // Store the chunk
-                fileChunks[chunkIndex] = chunkData;
-                downloaded += chunkData.byteLength;
-                
-                // Update progress
-                setDownloadProgress({
-                  fileId: file.id,
-                  progress: Math.round((downloaded / totalSize) * 100),
-                  status: 'downloading'
-                });
-                
-                return chunkData;
-              })
-          );
-        }
-        
-        // Wait for this batch of chunks
-        await Promise.all(chunkPromises);
-      }
-      
-      // Combine all chunks into a single array buffer
-      let offset = 0;
-      for (const chunk of fileChunks) {
-        fileData.set(new Uint8Array(chunk), offset);
-        offset += chunk.byteLength;
-      }
-      
-      // Create a blob from the file data
-      const blob = new Blob([fileData], { type: getMimeTypeFromFileName(file.name) });
-      const fileUrl = URL.createObjectURL(blob);
-      
-      // Update file in state
-      const updatedFile = {
-        ...file,
-        url: fileUrl,
-        synced: true,
-        size: totalSize
-      };
-      
-      // Update the folder in state
-      setSyncFolders(prev => prev.map(f => {
-        if (f.id === folder.id) {
-          const updatedFiles = f.files.map(fileItem => 
-            fileItem.id === file.id ? updatedFile : fileItem
-          );
-          
-          return {
-            ...f,
-            files: updatedFiles
-          };
-        }
-        return f;
-      }));
-      
-      // Update the folderFiles view if this is the current folder
-      if (currentFolder && currentFolder.id === folder.id) {
-        setFolderFiles(prev => prev.map(fileItem => 
-          fileItem.id === file.id ? {
-            ...updatedFile,
-            path: `${folder.path}/${file.name}`
-          } : fileItem
-        ));
-      }
-      
-      // Add a transaction record
-      const transaction = {
-        hash: '0x' + Math.random().toString(16).substr(2, 40),
-        timestamp: new Date().toISOString(),
-        sender: peerId,
-        fileInfo: {
-          name: file.name,
-          size: totalSize,
-          type: file.type,
-          infoHash: file.id,
-          folderId: folder.id
-        }
-      };
-      
-      setTransactions(prev => [transaction, ...prev]);
-      
-      // Clear progress indicator
-      setDownloadProgress({
-        fileId: file.id,
-        progress: 100,
-        status: 'complete'
-      });
-      
-      // Return the updated file
-      return updatedFile;
     } catch (error) {
-      // Show error in UI
-      setDownloadProgress({
-        fileId: file.id,
-        progress: 0,
-        status: 'error',
-        error: error.message
-      });
-      
-      throw error;
+      if (peerWrapper && peerWrapper.removeMessageHandler && handlerId) {
+        peerWrapper.removeMessageHandler(handlerId);
+      }
+      delete pendingRequests.current[requestId];
+      reject(error);
     }
-  };
+  });
+};
+  
+// Download a file from peers
+const downloadFileFromPeers = async (file, folder) => {
+  // Check if the file is already available locally
+  if (file.synced && file.url) {
+    return file;
+  }
+  
+  // Check if we have peers that have this file
+  if (!file.availableFrom || file.availableFrom.length === 0) {
+    throw new Error('No peers have this file');
+  }
+  
+  // Use the first available peer
+  const peerId = file.availableFrom[0];
+  const peer = connectedPeers.current[peerId];
+  
+  if (!peer) {
+    throw new Error('Peer connection not available');
+  }
+  
+  // Start the download process
+  try {
+    // Show progress in UI
+    setDownloadProgress({
+      fileId: file.id,
+      progress: 0,
+      status: 'starting'
+    });
+    
+    // Request file metadata first
+    const metadataResponse = await peer.requestFile(file.id, folder.id, 0, 0);
+    
+    // The response should include the total file size
+    const totalSize = metadataResponse.totalSize || file.size;
+    const chunks = Math.ceil(totalSize / chunkSize);
+    
+    console.log(`Downloading file ${file.name} (${formatFileSize(totalSize)}) in ${chunks} chunks`);
+    
+    // Initialize array buffer to store the full file
+    const fileData = new Uint8Array(totalSize);
+    
+    // Download the chunks
+    let downloaded = 0;
+    const concurrentRequests = 3; // Number of chunks to download concurrently
+    
+    // Process chunks in batches
+    for (let i = 0; i < chunks; i += concurrentRequests) {
+      const chunkPromises = [];
+      
+      // Create promises for concurrent chunk downloads
+      for (let j = 0; j < concurrentRequests && i + j < chunks; j++) {
+        const chunkIndex = i + j;
+        const chunkStart = chunkIndex * chunkSize;
+        const chunkEnd = Math.min(chunkStart + chunkSize, totalSize);
+        
+        chunkPromises.push(
+          peer.requestFile(file.id, folder.id, chunkStart, chunkEnd)
+            .then(chunkData => {
+              // Ensure we received binary data
+              if (!(chunkData instanceof ArrayBuffer) && !(chunkData instanceof Uint8Array)) {
+                throw new Error('Received non-binary data for file chunk');
+              }
+              
+              // Convert to Uint8Array if needed
+              const chunkUint8 = chunkData instanceof ArrayBuffer ? 
+                new Uint8Array(chunkData) : chunkData;
+              
+              // Store the chunk at the correct position in the full file data
+              fileData.set(chunkUint8, chunkStart);
+              
+              downloaded += chunkUint8.byteLength;
+              
+              // Update progress
+              setDownloadProgress({
+                fileId: file.id,
+                progress: Math.round((downloaded / totalSize) * 100),
+                status: 'downloading'
+              });
+              
+              return chunkData;
+            })
+            .catch(error => {
+              console.error(`Error downloading chunk ${chunkIndex}:`, error);
+              throw error;
+            })
+        );
+      }
+      
+      // Wait for this batch of chunks
+      await Promise.all(chunkPromises);
+    }
+    
+    console.log(`Download complete for ${file.name}, creating blob`);
+    
+    // Create a blob from the file data
+    const blob = new Blob([fileData], { type: getMimeTypeFromFileName(file.name) });
+    const fileUrl = URL.createObjectURL(blob);
+    
+    // Update file in state
+    const updatedFile = {
+      ...file,
+      url: fileUrl,
+      synced: true,
+      size: totalSize
+    };
+    
+    // Update the folder in state
+    setSyncFolders(prev => prev.map(f => {
+      if (f.id === folder.id) {
+        const updatedFiles = f.files.map(fileItem => 
+          fileItem.id === file.id ? updatedFile : fileItem
+        );
+        
+        return {
+          ...f,
+          files: updatedFiles
+        };
+      }
+      return f;
+    }));
+    
+    // Update the folderFiles view if this is the current folder
+    if (currentFolder && currentFolder.id === folder.id) {
+      setFolderFiles(prev => prev.map(fileItem => 
+        fileItem.id === file.id ? {
+          ...updatedFile,
+          path: `${folder.path}/${file.name}`
+        } : fileItem
+      ));
+    }
+    
+    // Add a transaction record
+    const transaction = {
+      hash: '0x' + Math.random().toString(16).substr(2, 40),
+      timestamp: new Date().toISOString(),
+      sender: peerId,
+      fileInfo: {
+        name: file.name,
+        size: totalSize,
+        type: file.type,
+        infoHash: file.id,
+        folderId: folder.id
+      }
+    };
+    
+    setTransactions(prev => [transaction, ...prev]);
+    
+    // Clear progress indicator
+    setDownloadProgress({
+      fileId: file.id,
+      progress: 100,
+      status: 'complete'
+    });
+    
+    // Return the updated file
+    return updatedFile;
+  } catch (error) {
+    // Show error in UI
+    setDownloadProgress({
+      fileId: file.id,
+      progress: 0,
+      status: 'error',
+      error: error.message
+    });
+    
+    throw error;
+  }
+};
   
   // Add a folder from peer information
   const addFolderFromPeer = (folderInfo, peerId) => {
@@ -1679,274 +2342,149 @@ const broadcastFolderAddedByKey = (folder, files) => {
     return newFolder;
   };
   
-  // Request a folder from peers by secretKey
-  const requestFolderFromPeers = async (secretKey) => {
-    const connectedPeerIds = Object.keys(connectedPeers.current);
-    console.log(`🔍 Looking for folder with key ${secretKey} among ${connectedPeerIds.length} peers`);
+// Request a folder from peers by secretKey
+const requestFolderFromPeers = async (secretKey) => {
+  const connectedPeerIds = Object.keys(connectedPeers.current);
+  console.log(`🔍 Looking for folder with key ${secretKey} among ${connectedPeerIds.length} peers`);
+  
+  if (connectedPeerIds.length === 0) {
+    console.log('❌ No connected peers available');
+    return null;
+  }
+  
+  // Create a unique request ID
+  const requestId = 'folderReq_' + Math.random().toString(36).substr(2, 9);
+  
+  // Create a promise that will be resolved when we get a response
+  return new Promise((resolve) => {
+    // Store responding peers
+    const respondingPeers = [];
+    const pendingRequests = [];
     
-    if (connectedPeerIds.length === 0) {
-      console.log('❌ No connected peers available');
-      return null;
-    }
-    
-    // Create a unique request ID
-    const requestId = 'folderReq_' + Math.random().toString(36).substr(2, 9);
-    
-    // Create a promise that will be resolved when we get a response
-    return new Promise((resolve) => {
-      // Store responding peers
-      const respondingPeers = [];
-      
-      // Setup response handlers for each peer
-      for (const peerId of connectedPeerIds) {
+    // Set a timeout to resolve with whatever we've got
+    const timeoutId = setTimeout(() => {
+      // Clean up all handlers
+      pendingRequests.forEach(({ peerId, handlerId }) => {
         const peer = connectedPeers.current[peerId];
-        if (!peer || !peer.dataChannel || peer.dataChannel.readyState !== 'open') {
-          console.log(`❌ Peer ${peerId} not available (${peer?.dataChannel?.readyState || 'no data channel'})`);
-          continue;
+        if (peer && peer.removeMessageHandler) {
+          peer.removeMessageHandler(handlerId);
         }
-        
-        console.log(`📤 Sending folder request to peer ${peerId} for key ${secretKey}`);
-        
-        // Create a handler specific to this peer - with proper closure over peerId
-        const responseHandler = function(event) {
-          try {
-            // Safely convert data to string if needed
-            const dataStr = typeof event.data === 'string' ? event.data : 
-                           (event.data instanceof ArrayBuffer || event.data instanceof Uint8Array) ? 
-                           new TextDecoder().decode(event.data) : JSON.stringify(event.data);
-            
-            const message = JSON.parse(dataStr);
-            
-            console.log(`Received message from peer ${peerId}, type: ${message.type}`);
-            
-            if (message.type === 'FOLDER_RESPONSE' && 
-                message.data && 
-                message.data.requestId === requestId) {
-              
-              console.log(`✅ Got folder response from peer ${peerId}:`, 
-                        message.data.folderInfo ? 'Found folder' : 'No folder found');
-              
-              // Remove this handler
-              peer.dataChannel.removeEventListener('message', responseHandler);
-              
-              // Store the response if folder was found
-              if (message.data.folderInfo) {
-                respondingPeers.push({
-                  peerId,
-                  folderInfo: message.data.folderInfo
-                });
-                
-                // Immediately resolve if we found the folder
-                resolve(respondingPeers[0]);
-              }
-            }
-          } catch (error) {
-            console.error(`Error handling message from peer ${peerId}:`, error);
-          }
-        };
-        
-        // Add the event listener
-        peer.dataChannel.addEventListener('message', responseHandler);
-        
-        // Store the handler for cleanup in the timeout
-        if (!peer.tempHandlers) peer.tempHandlers = {};
-        peer.tempHandlers[requestId] = responseHandler;
-        
-        // Send the request
-        try {
-          const requestPayload = {
-            type: 'FOLDER_REQUEST',
-            data: {
-              secretKey,
-              requestId
-            }
-          };
-          
-          console.log(`Sending folder request to peer ${peerId}:`, requestPayload);
-          
-          // Use the raw data channel to ensure message is delivered
-          peer.dataChannel.send(JSON.stringify(requestPayload));
-        } catch (err) {
-          console.error(`Error sending folder request to peer ${peerId}:`, err);
-          // Clean up the handler if send fails
-          peer.dataChannel.removeEventListener('message', responseHandler);
-          if (peer.tempHandlers) delete peer.tempHandlers[requestId];
-        }
-      }
+      });
       
-      // Set a timeout to resolve with whatever we've got
-      setTimeout(() => {
-        // Clean up all handlers
-        connectedPeerIds.forEach(peerId => {
-          const peer = connectedPeers.current[peerId];
-          if (peer && peer.dataChannel && peer.tempHandlers && peer.tempHandlers[requestId]) {
-            try {
-              peer.dataChannel.removeEventListener('message', peer.tempHandlers[requestId]);
-            } catch (err) {
-              console.error(`Error removing event listener:`, err);
-            }
-            delete peer.tempHandlers[requestId];
-          }
-        });
-        
-        // Resolve with the first response if any, otherwise null
-        if (respondingPeers.length > 0) {
-          resolve(respondingPeers[0]);
-        } else {
-          console.log(`⏰ Timeout: No peers responded with folder info for key ${secretKey}`);
-          resolve(null);
-        }
-      }, 10000); // 10 second timeout
-    });
-  };
-
-  const addFolderByKey = async (secretKey) => {
-    // Validate that a key was provided
-    if (!secretKey || secretKey.trim() === '') {
-      showNotification('Please enter a valid share key', 'error');
-      return;
-    }
+      // Resolve with the first response if any, otherwise null
+      if (respondingPeers.length > 0) {
+        resolve(respondingPeers[0]);
+      } else {
+        console.log(`⏰ Timeout: No peers responded with folder info for key ${secretKey}`);
+        resolve(null);
+      }
+    }, 10000); // 10 second timeout
     
-    // Check if this folder is already added
-    const existingFolder = syncFolders.find(folder => folder.secretKey === secretKey);
-    if (existingFolder) {
-      showNotification('This folder is already in your library', 'error');
-      return;
-    }
-    
-    showNotification('Connecting to shared folder...', 'info');
-    
-    // Log connected peers and check data channel states
-    const connectedPeerIds = Object.keys(connectedPeers.current);
-    console.log(`Connected peers: ${connectedPeerIds.length}`, connectedPeerIds);
+    // Send request to each connected peer
     for (const peerId of connectedPeerIds) {
       const peer = connectedPeers.current[peerId];
-      const readyState = peer?.dataChannel?.readyState;
-      console.log(`Peer ${peerId} data channel state: ${readyState || 'unknown'}`);
-    }
-    
-    let peerFolderFound = false;
-    
-    if (connectedPeerIds.length > 0) {
-      try {
-        // Create a unique request ID for this folder request
-        const requestId = 'folderReq_' + Math.random().toString(36).substr(2, 9);
-        console.log(`Searching for folder with key ${secretKey} among ${connectedPeerIds.length} peers...`);
-        
-        // Store responses from peers
-        const responses = [];
-        
-        // Create a promise that will resolve when a response is received or timeout occurs
-        const folderRequestPromise = new Promise((resolveRequest) => {
-          connectedPeerIds.forEach(peerId => {
-            const peer = connectedPeers.current[peerId];
-            if (!peer || !peer.dataChannel || peer.dataChannel.readyState !== 'open') {
-              console.log(`Skipping peer ${peerId}: data channel not ready`);
-              return;
-            }
-            
-            console.log(`Sending folder request to peer ${peerId}`);
-            
-            // Define a handler for this specific peer
-            const messageHandler = function(event) {
-              try {
-                const message = JSON.parse(event.data);
-                console.log(`Received message from peer ${peerId}:`, message.type);
-                
-                // Check if this is a response to our folder request
-                if (message.type === 'FOLDER_RESPONSE' &&
-                    message.data &&
-                    message.data.requestId === requestId) {
-                  console.log(`Got folder response from peer ${peerId}`);
-                  if (message.data.folderInfo) {
-                    console.log(`Peer ${peerId} has folder with key ${secretKey}`);
-                    responses.push({
-                      peerId,
-                      folderInfo: message.data.folderInfo
-                    });
-                    
-                    // Remove this handler since we got our response
-                    try {
-                      peer.dataChannel.removeEventListener('message', messageHandler);
-                    } catch (err) {
-                      console.error('Error removing message handler:', err);
-                    }
-                    resolveRequest(true);
-                  }
-                }
-              } catch (error) {
-                console.error(`Error handling message from peer ${peerId}:`, error);
-              }
-            };
-            
-            try {
-              // Add the event listener and store it for cleanup
-              peer.dataChannel.addEventListener('message', messageHandler);
-              if (!peer.tempHandlers) peer.tempHandlers = {};
-              peer.tempHandlers[requestId] = messageHandler;
-              
-              // Send the folder request to the peer
-              peer.dataChannel.send(JSON.stringify({
-                type: 'FOLDER_REQUEST',
-                data: {
-                  secretKey,
-                  requestId
-                }
-              }));
-              console.log(`Folder request sent to peer ${peerId}`);
-            } catch (error) {
-              console.error(`Error setting up request to peer ${peerId}:`, error);
-            }
-          });
-          
-          // Set a timeout to resolve the promise after 15 seconds if no valid response is received
-          setTimeout(() => {
-            console.log('Folder request timeout after 15 seconds');
-            resolveRequest(false);
-          }, 15000);
-        });
-        
-        // Wait for the folder request to complete
-        await folderRequestPromise;
-        
-        // Clean up all event listeners
-        connectedPeerIds.forEach(peerId => {
-          const peer = connectedPeers.current[peerId];
-          if (peer && peer.dataChannel && peer.tempHandlers && peer.tempHandlers[requestId]) {
-            try {
-              peer.dataChannel.removeEventListener('message', peer.tempHandlers[requestId]);
-            } catch (err) {
-              console.error('Error removing event listener:', err);
-            }
-            delete peer.tempHandlers[requestId];
-          }
-        });
-        
-        console.log(`Folder request completed. Found ${responses.length} responses.`);
-        
-        // If any peer responded with folder info, use the first response
-        if (responses.length > 0) {
-          const { peerId, folderInfo } = responses[0];
-          console.log(`Using folder info from peer ${peerId}:`, folderInfo);
-          const newFolder = addFolderFromPeer(folderInfo, peerId);
-          if (newFolder) {
-            peerFolderFound = true;
-            showNotification(`Added shared folder: ${newFolder.name}`, 'success');
-            return newFolder;
-          }
-        } else {
-          console.log('No peers responded with folder info');
-        }
-      } catch (error) {
-        console.error('Error in peer folder request:', error);
+      if (!peer || peer.status !== 'connected') {
+        console.log(`❌ Peer ${peerId} not available or not connected`);
+        continue;
       }
-    } else {
-      console.log('No connected peers available');
+      
+      try {
+        console.log(`📤 Sending folder request to peer ${peerId} for key ${secretKey}`);
+        
+        // Add a handler for the FOLDER_RESPONSE message
+        const handlerId = peer.addMessageHandler('FOLDER_RESPONSE', (message) => {
+          if (message.data && message.data.requestId === requestId) {
+            console.log(`✅ Got folder response from peer ${peerId}:`, 
+                      message.data.folderInfo ? 'Found folder' : 'No folder found');
+            
+            // Remove this handler
+            peer.removeMessageHandler(handlerId);
+            
+            // Remove from pending requests
+            const index = pendingRequests.findIndex(req => req.handlerId === handlerId);
+            if (index !== -1) {
+              pendingRequests.splice(index, 1);
+            }
+            
+            // Store the response if folder was found
+            if (message.data.folderInfo) {
+              respondingPeers.push({
+                peerId,
+                folderInfo: message.data.folderInfo
+              });
+              
+              // Immediately resolve and clear timeout if we found the folder
+              clearTimeout(timeoutId);
+              
+              // Clean up any remaining handlers
+              pendingRequests.forEach(({ peerId, handlerId }) => {
+                const peer = connectedPeers.current[peerId];
+                if (peer && peer.removeMessageHandler) {
+                  peer.removeMessageHandler(handlerId);
+                }
+              });
+              
+              resolve(respondingPeers[0]);
+            }
+            
+            return true; // Mark as handled
+          }
+          return false; // Not handled
+        }, 12000); // Slightly longer than our overall timeout
+        
+        // Track this request for cleanup
+        pendingRequests.push({ peerId, handlerId });
+        
+        // Send the request
+        peer.send({
+          type: 'FOLDER_REQUEST',
+          data: {
+            secretKey,
+            requestId
+          }
+        });
+      } catch (err) {
+        console.error(`Error sending folder request to peer ${peerId}:`, err);
+      }
     }
-    
-    // If no valid folder was found from peers, return null
-    return null;
-  };
+  });
+};
+
+const addFolderByKey = async (secretKey) => {
+  // Validate that a key was provided
+  if (!secretKey || secretKey.trim() === '') {
+    showNotification('Please enter a valid share key', 'error');
+    return;
+  }
+  
+  // Check if this folder is already added
+  const existingFolder = syncFolders.find(folder => folder.secretKey === secretKey);
+  if (existingFolder) {
+    showNotification('This folder is already in your library', 'error');
+    return;
+  }
+  
+  showNotification('Connecting to shared folder...', 'info');
+  
+  // Use our standardized function to request the folder from peers
+  const peerResponse = await requestFolderFromPeers(secretKey);
+  
+  if (peerResponse) {
+    const { peerId, folderInfo } = peerResponse;
+    console.log(`Using folder info from peer ${peerId}:`, folderInfo);
+    const newFolder = addFolderFromPeer(folderInfo, peerId);
+    if (newFolder) {
+      showNotification(`Added shared folder: ${newFolder.name}`, 'success');
+      return newFolder;
+    }
+  } else {
+    console.log('No peers responded with folder info');
+    showNotification('Could not find shared folder with that key', 'error');
+  }
+  
+  // If no valid folder was found from peers, return null
+  return null;
+};
   
   // Handle incoming folder from key from other tabs
   const handleIncomingFolderFromKey = (data) => {
