@@ -153,84 +153,84 @@ useEffect(() => {
         };
         
         // Store the connection state for this peer
-        if (!peers.current[peerInfo.id] || peers.current[peerInfo.id].status === 'error') {
-          // Only create a new connection if we're the initiator and there isn't already a connection
-          // OR if there's an existing connection in error state
-          if (shouldInitiate) {
-            console.log(`Creating connection to ${peerInfo.id} as initiator`);
-            
-            // Clean up any existing connection properly
-            if (peers.current[peerInfo.id]) {
-              await safeDestroyPeer(peerInfo.id);
-              delete peers.current[peerInfo.id];
+          if (!peers.current[peerInfo.id] || peers.current[peerInfo.id].status === 'error') {
+            // Only create a new connection if we're the initiator and there isn't already a connection
+            // OR if there's an existing connection in error state
+            if (shouldInitiate) {
+              console.log(`Creating connection to ${peerInfo.id} as initiator`);
               
-              // Give time for cleanup to complete
-              await new Promise(resolve => setTimeout(resolve, 500));
-            }
-            
-            // Create and store preliminary connection state before actual connection
-            peers.current[peerInfo.id] = {
-              status: 'connecting',
-              peerId: peerInfo.id,
-              isInitiator: true,
-              ...peerConnectionState
-            };
-            
-            // Create new connection
-            try {
-              const peerConnection = await createPeerConnection(peerInfo.id, true, signalingServer);
+              // Clean up any existing connection properly
+              if (peers.current[peerInfo.id]) {
+                await safeDestroyPeer(peerInfo.id);
+                delete peers.current[peerInfo.id];
+                
+                // Give time for cleanup to complete
+                await new Promise(resolve => setTimeout(resolve, 500));
+              }
               
-              // Update with full connection info only if our connecting state still matches
+              // Create and store preliminary connection state before actual connection
+              peers.current[peerInfo.id] = {
+                status: 'connecting',
+                peerId: peerInfo.id,
+                isInitiator: true,
+                ...peerConnectionState
+              };
+              
+              // Create new connection
+              try {
+                const peerConnection = await createPeerConnection(peerInfo.id, true, signalingServer);
+                
+                  // Update with full connection info only if our connecting state still matches
               // This prevents race conditions with simultaneous connection attempts
               if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
-                peers.current[peerInfo.id] = {
-                  ...peerConnection,
-                  isInitiator: true,
-                  ...peerConnectionState
-                };
-              // } else {
-              //   // A newer connection attempt has replaced our state, destroy this connection
-              //   if (peerConnection.destroy) peerConnection.destroy();
-              //   else if (peerConnection.peer && peerConnection.peer.destroy) peerConnection.peer.destroy();
-              }
-            } catch (error) {
-              console.error(`Error creating connection to ${peerInfo.id}:`, error);
+                  peers.current[peerInfo.id] = {
+                    ...peerConnection,
+                    isInitiator: true,
+                    ...peerConnectionState
+                  };
+                } else {
+                  // A newer connection attempt has replaced our state, destroy this connection
+                  if (peerConnection.destroy) peerConnection.destroy();
+                  else if (peerConnection.peer && peerConnection.peer.destroy) peerConnection.peer.destroy();
+                }
+              } catch (error) {
+                console.error(`Error creating connection to ${peerInfo.id}:`, error);
               if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
-                peers.current[peerInfo.id].status = 'error';
+                  peers.current[peerInfo.id].status = 'error';
+                }
               }
+            } else {
+              console.log(`Waiting for ${peerInfo.id} to initiate connection to us`);
+              // Store state showing we're expecting an inbound connection
+              peers.current[peerInfo.id] = {
+                status: 'awaiting_offer',
+                peerId: peerInfo.id,
+                isInitiator: false,
+                ...peerConnectionState
+              };
             }
           } else {
-            console.log(`Waiting for ${peerInfo.id} to initiate connection to us`);
-            // Store state showing we're expecting an inbound connection
-            peers.current[peerInfo.id] = {
-              status: 'awaiting_offer',
-              peerId: peerInfo.id,
-              isInitiator: false,
-              ...peerConnectionState
-            };
+            console.log(`Connection already exists or in progress for peer ${peerInfo.id}`);
           }
-        } else {
-          console.log(`Connection already exists or in progress for peer ${peerInfo.id}`);
-        }
-        
-        // Check for common folders (keep this logic in both cases)
-        const commonFolders = syncFolders.filter(folder => 
-          peerInfo.folders.some(f => f.secretKey === folder.secretKey)
-        );
-        
-        console.log(`Common folders with peer ${peerInfo.id}:`, commonFolders.length);
-        
-        if (commonFolders.length > 0) {
-          // We have common folders with this peer, update folder device count
-          commonFolders.forEach(folder => {
+          
+              // Check for common folders (keep this logic in both cases)
+              const commonFolders = syncFolders.filter(folder => 
+                peerInfo.folders.some(f => f.secretKey === folder.secretKey)
+              );
+              
+              console.log(`Common folders with peer ${peerInfo.id}:`, commonFolders.length);
+              
+              if (commonFolders.length > 0) {
+                // We have common folders with this peer, update folder device count
+                commonFolders.forEach(folder => {
             // Update folder in state
-            setSyncFolders(prev => prev.map(f => 
-              f.id === folder.id
-                ? { ...f, devices: f.devices + 1, peers: [...(f.peers || []), peerInfo.id] }
-                : f
-            ));
-          });
-        }
+                  setSyncFolders(prev => prev.map(f => 
+                    f.id === folder.id
+                      ? { ...f, devices: f.devices + 1, peers: [...(f.peers || []), peerInfo.id] }
+                      : f
+                  ));
+                });
+              }
       });
       
       // Listen for peer disconnect events
@@ -638,19 +638,19 @@ const connectToSignalingServer = async () => {
         console.log(`🟢 Connected to signaling server: ${socketConnection.id}`);
         
         // Create the signaling interface
-        const signalingInterface = {
-          announce: (data) => {
+const signalingInterface = {
+  announce: (data) => {
             console.log(`Announcing presence with folders:`, 
                        data.folders.map(f => f.secretKey));
-            socketConnection.emit('announce', data);
-          },
-          on: (event, callback) => {
-            socketConnection.on(event, callback);
-          },
-          send: (to, data) => {
+    socketConnection.emit('announce', data);
+  },
+  on: (event, callback) => {
+    socketConnection.on(event, callback);
+  },
+  send: (to, data) => {
             console.log(`Sending signal to ${to}, type: ${data.type || 'candidate'}`);
-            socketConnection.emit('signal', { to, signal: data });
-          },
+    socketConnection.emit('signal', { to, signal: data });
+  },
           networkId: socketConnection.id,
           disconnect: () => {
             // Clean up event listeners before disconnecting
@@ -660,12 +660,12 @@ const connectToSignalingServer = async () => {
             socketConnection.disconnect();
           },
           // Add this to safely clean up event listeners
-          removeAllListeners: () => {
-            ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
-              socketConnection.off(event);
-            });
-          }
-        };
+  removeAllListeners: () => {
+    ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
+      socketConnection.off(event);
+    });
+  }
+};
         
         resolve(signalingInterface);
       });
@@ -3235,527 +3235,642 @@ const addFolderByKey = async (secretKey) => {
       }
     }
   }, [currentFolder, syncFolders]);
-  
+
   // If authentication is loading, show a loading screen
-  if (isAuthLoading) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-gray-50">
-        <div className="text-center">
-          <RefreshCw className="animate-spin h-12 w-12 text-blue-500 mx-auto mb-4" />
-          <h1 className="text-xl font-semibold text-gray-700">Loading BlockSync...</h1>
-        </div>
+if (isAuthLoading) {
+  return (
+    <div className="flex items-center justify-center h-screen bg-gray-900">
+      <div className="text-center">
+        <RefreshCw className="animate-spin h-12 w-12 text-[#A7236F] mx-auto mb-4" />
+        <h1 className="text-xl font-semibold text-white">Loading BlockSync...</h1>
       </div>
-    );
-  }
-  
-  // If user is not logged in, show the login screen
-  if (!user) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-gray-50">
-        <div className="bg-white p-8 rounded-lg shadow-lg max-w-md w-full">
-          <div className="text-center mb-8">
-            <RefreshCw className="h-12 w-12 text-blue-500 mx-auto mb-4" />
-            <h1 className="text-2xl font-bold text-gray-800">BlockSync</h1>
-            <p className="text-gray-600 mt-2">Secure P2P file sharing with blockchain metadata</p>
-          </div>
-          
-          <button 
-            className="w-full bg-blue-500 hover:bg-blue-600 text-white font-medium py-3 px-4 rounded-lg flex items-center justify-center gap-2"
-            onClick={signInWithGoogle}
-          >
-            <User size={20} />
-            Sign in to continue
-          </button>
-          
-          <p className="text-center text-sm text-gray-500 mt-6">
-            By signing in, you agree to our Terms of Service and Privacy Policy.
-          </p>
+    </div>
+  );
+}
+
+// If user is not logged in, show the login screen
+if (!user) {
+  return (
+    <div className="flex items-center justify-center h-screen bg-gray-900">
+      <div className="bg-gray-800 p-8 rounded-lg shadow-lg max-w-md w-full border border-gray-700">
+        <div className="text-center mb-8">
+          <RefreshCw className="h-12 w-12 text-[#A7236F] mx-auto mb-4" />
+          <h1 className="text-2xl font-bold text-white">BlockSync</h1>
+          <p className="text-gray-300 mt-2">Secure P2P file sharing with blockchain metadata</p>
         </div>
+        <button
+          className="w-full bg-[#A7236F] hover:bg-[#8A1D5B] text-white font-medium py-3 px-4 rounded-lg flex items-center justify-center gap-2"
+          onClick={signInWithGoogle}
+        >
+          <User size={20} />
+          Sign in to continue
+        </button>
+        <p className="text-center text-sm text-gray-400 mt-6">
+          By signing in, you agree to our Terms of Service and Privacy Policy.
+        </p>
       </div>
-    );
-  }
+    </div>
+  );
+}
   
   // Main application UI when user is logged in
-  return (
-    <div className="flex flex-col w-full h-screen bg-gray-50 text-gray-800">
-      {/* Header */}
-      <header className="p-4 bg-white shadow-sm border-b">
-        <div className="container mx-auto flex justify-between items-center">
-          <h1 className="text-2xl font-semibold flex items-center gap-2">
-            <RefreshCw className="text-blue-500" />
-            BlockSync
-          </h1>
-          
-          <div className="flex items-center gap-4">
-            {/* P2P Network Status */}
-            <div className="text-sm flex items-center gap-2 bg-blue-50 p-1 px-2 rounded-full">
-              <div className={`w-2 h-2 rounded-full ${peerNetworkState.connected ? 'bg-green-500' : 'bg-gray-400'}`}></div>
-              <span>
-                {peerNetworkState.peerCount} peer{peerNetworkState.peerCount !== 1 ? 's' : ''}
-              </span>
-            </div>
-            
-            {/* Device info */}
-            <div className="text-sm flex items-center gap-2">
-              <div className="w-2 h-2 rounded-full bg-green-500"></div>
-              <span>My Device</span>
-            </div>
-            
-            {/* User info */}
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-500">
-                {user.photoURL ? (
-                  <img src={user.photoURL} alt={user.displayName} className="w-full h-full rounded-full" />
-                ) : (
-                  <User size={18} />
-                )}
-              </div>
-              <div className="text-sm">
-                <p className="font-medium">{user.displayName}</p>
-                <p className="text-xs text-gray-500">{user.email}</p>
-              </div>
-            </div>
-            
-            {/* Settings and logout */}
-            <div className="flex items-center gap-2">
-              <button className="p-2 rounded-full text-gray-500 hover:bg-gray-100">
-                <Settings size={20} />
+return (
+  <div className="flex flex-col w-full h-screen bg-gray-900 text-white">
+    {/* Header */}
+    {/* Header */}
+<header className="p-4 bg-[#A7236F] shadow-sm border-b">
+  <div className="container mx-auto flex justify-between items-center">
+    <h1 className="text-2xl font-semibold flex items-center gap-2">
+      <RefreshCw className="text-white" />
+      BlockSync
+    </h1>
+    
+    <div className="flex items-center gap-4">
+      {/* P2P Network Status */}
+      <div className="text-sm flex items-center gap-2 bg-[#8A1D5B] p-1 px-2 rounded-full">
+        <div className={`w-2 h-2 rounded-full ${peerNetworkState.connected ? 'bg-green-500' : 'bg-gray-400'}`}></div>
+        <span>
+          {peerNetworkState.peerCount} peer{peerNetworkState.peerCount !== 1 ? 's' : ''}
+        </span>
+      </div>
+      
+      {/* Device info */}
+      <div className="text-sm flex items-center gap-2">
+        <div className="w-2 h-2 rounded-full bg-green-500"></div>
+        <span>My Device</span>
+      </div>
+      
+      {/* User info */}
+      <div className="flex items-center gap-2">
+        <div className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center text-[#A7236F]">
+          {user && user.photoURL ? (
+            <img src={user.photoURL} alt={user.displayName || 'User'} className="w-full h-full rounded-full" />
+          ) : (
+            <User size={18} />
+          )}
+        </div>
+        <div className="text-sm">
+          <p className="font-medium">{user ? user.displayName : 'User'}</p>
+          <p className="text-xs text-gray-300">{user ? user.email : ''}</p>
+        </div>
+      </div>
+      
+      {/* Settings and logout */}
+      <div className="flex items-center gap-2">
+        <button className="p-2 rounded-full text-gray-300 hover:bg-[#8A1D5B]">
+          <Settings size={20} />
+        </button>
+        <button 
+          className="p-2 rounded-full text-gray-300 hover:bg-[#8A1D5B]"
+          onClick={handleSignOut}
+        >
+          <LogOut size={20} />
+        </button>
+      </div>
+    </div>
+  </div>
+</header>
+    
+    {/* Main layout */}
+    <div className="flex-1 flex overflow-hidden">
+      {/* Sidebar */}
+      <div className="w-64 bg-gray-800 border-r border-gray-700 overflow-y-auto p-4">
+        {/* Tabs */}
+        <div className="flex border-b border-gray-700 mb-4">
+          <button 
+            className={`flex-1 pb-2 font-medium text-sm ${activeTab === 'folders' ? 'text-teal-400 border-b-2 border-teal-400' : 'text-gray-400'}`}
+            onClick={() => setActiveTab('folders')}
+          >
+            Folders
+          </button>
+          <button 
+            className={`flex-1 pb-2 font-medium text-sm ${activeTab === 'devices' ? 'text-teal-400 border-b-2 border-teal-400' : 'text-gray-400'}`}
+            onClick={() => setActiveTab('devices')}
+          >
+            Devices
+          </button>
+        </div>
+        
+        {/* Folders tab */}
+        {activeTab === 'folders' && (
+          <div className="space-y-4">
+            {/* Add buttons */}
+            <div className="flex gap-2">
+              <button 
+                className="flex-1 bg-teal-600 text-white rounded-md p-2 text-sm font-medium flex items-center justify-center gap-1"
+                onClick={() => setNewFolderModal(true)}
+              >
+                <Plus size={16} />
+                Add Folder
               </button>
               <button 
-                className="p-2 rounded-full text-gray-500 hover:bg-gray-100"
-                onClick={handleSignOut}
+                className="flex-1 bg-gray-700 text-gray-200 rounded-md p-2 text-sm font-medium flex items-center justify-center gap-1"
+                onClick={() => {
+                  const key = prompt('Enter share key:');
+                  if (key) addFolderByKey(key);
+                }}
               >
-                <LogOut size={20} />
+                <Link size={16} />
+                Enter Key
               </button>
             </div>
-          </div>
-        </div>
-      </header>
-      
-      {/* Main layout */}
-      <div className="flex-1 flex overflow-hidden">
-        {/* Sidebar */}
-        <div className="w-64 bg-white border-r overflow-y-auto p-4">
-          {/* Tabs */}
-          <div className="flex border-b mb-4">
-            <button 
-              className={`flex-1 pb-2 font-medium text-sm ${activeTab === 'folders' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-500'}`}
-              onClick={() => setActiveTab('folders')}
-            >
-              Folders
-            </button>
-            <button 
-              className={`flex-1 pb-2 font-medium text-sm ${activeTab === 'devices' ? 'text-blue-500 border-b-2 border-blue-500' : 'text-gray-500'}`}
-              onClick={() => setActiveTab('devices')}
-            >
-              Devices
-            </button>
-          </div>
-          
-          {/* Folders tab */}
-          {activeTab === 'folders' && (
-            <div className="space-y-4">
-              {/* Add buttons */}
-              <div className="flex gap-2">
-                <button 
-                  className="flex-1 bg-blue-500 text-white rounded-md p-2 text-sm font-medium flex items-center justify-center gap-1"
-                  onClick={() => setNewFolderModal(true)}
-                >
-                  <Plus size={16} />
-                  Add Folder
-                </button>
-                <button 
-                  className="flex-1 bg-gray-100 text-gray-700 rounded-md p-2 text-sm font-medium flex items-center justify-center gap-1"
-                  onClick={() => {
-                    const key = prompt('Enter share key:');
-                    if (key) addFolderByKey(key);
-                  }}
-                >
-                  <Link size={16} />
-                  Enter Key
-                </button>
-              </div>
-              
-              {/* Folder list */}
-              <div className="space-y-2">
-                {syncFolders.length === 0 ? (
-                  <div className="text-center py-6 text-gray-500">
-                    <p>No folders yet</p>
-                    <p className="text-sm">Create a new folder to get started</p>
-                  </div>
-                ) : (
-                  syncFolders.map(folder => (
-                    <div 
-                      key={folder.id} 
-                      className={`p-3 rounded-lg cursor-pointer ${currentFolder && currentFolder.id === folder.id ? 'bg-blue-50 border border-blue-100' : 'hover:bg-gray-50'}`}
-                      onClick={() => setCurrentFolder(folder)}
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className={`w-8 h-8 rounded-md flex items-center justify-center text-white`} style={{ backgroundColor: folder.color }}>
-                          <FolderOpen size={18} />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <h3 className="font-medium text-sm truncate">{folder.name}</h3>
-                          <div className="flex items-center gap-2 text-xs text-gray-500">
-                            <span>{formatFileSize(folder.size)}</span>
-                            <span>•</span>
-                            <div className="flex items-center gap-1">
-                              <div className={`w-2 h-2 rounded-full ${getSyncStatusColor(folder)}`}></div>
-                              {folder.syncEnabled ? 'Synced' : 'Paused'}
-                            </div>
-                          </div>
-                        </div>
-                        <div className="flex flex-col items-end text-xs text-gray-500">
+            
+            {/* Folder list */}
+            <div className="space-y-2">
+              {syncFolders.length === 0 ? (
+                <div className="text-center py-6 text-gray-400">
+                  <p>No folders yet</p>
+                  <p className="text-sm">Create a new folder to get started</p>
+                </div>
+              ) : (
+                syncFolders.map(folder => (
+                  <div 
+                    key={folder.id} 
+                    className={`p-3 rounded-lg cursor-pointer ${currentFolder && currentFolder.id === folder.id ? 'bg-gray-700 border border-gray-600' : 'hover:bg-gray-700'}`}
+                    onClick={() => setCurrentFolder(folder)}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className={`w-8 h-8 rounded-md flex items-center justify-center text-white`} style={{ backgroundColor: folder.color }}>
+                        <FolderOpen size={18} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <h3 className="font-medium text-sm truncate">{folder.name}</h3>
+                        <div className="flex items-center gap-2 text-xs text-gray-400">
+                          <span>{formatFileSize(folder.size)}</span>
+                          <span>•</span>
                           <div className="flex items-center gap-1">
-                            {folder.encrypted && <Lock size={12} />}
-                            {folder.shared && <Share2 size={12} />}
+                            <div className={`w-2 h-2 rounded-full ${getSyncStatusColor(folder)}`}></div>
+                            {folder.syncEnabled ? 'Synced' : 'Paused'}
                           </div>
-                          <span>v{folder.version}</span>
                         </div>
                       </div>
+                      <div className="flex flex-col items-end text-xs text-gray-400">
+                        <div className="flex items-center gap-1">
+                          {folder.encrypted && <Lock size={12} />}
+                          {folder.shared && <Share2 size={12} />}
+                        </div>
+                        <span>v{folder.version}</span>
+                      </div>
                     </div>
-                  ))
-                )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+        
+        {/* Devices tab */}
+        {activeTab === 'devices' && (
+          <div className="space-y-4">
+            <div className="flex justify-between items-center">
+              <h3 className="font-medium text-sm text-gray-300">Connected Devices</h3>
+              <button className="text-teal-400 hover:text-teal-300 text-sm">
+                <RefreshCw size={14} />
+              </button>
+            </div>
+            
+            {/* My device */}
+            <div className="p-3 bg-gray-700 rounded-lg border border-gray-600">
+              <div className="flex items-center gap-3">
+                <div className="w-8 h-8 rounded-md bg-teal-600 flex items-center justify-center text-white">
+                  <HardDrive size={18} />
+                </div>
+                <div className="flex-1">
+                  <h3 className="font-medium text-sm">{activeDevice.name} (This device)</h3>
+                  <p className="text-xs text-gray-400">ID: {truncateHash(activeDevice.id)}</p>
+                </div>
+                <div className="flex items-center gap-1 text-xs bg-green-900 text-green-400 px-2 py-1 rounded">
+                  <div className="w-2 h-2 rounded-full bg-green-500"></div>
+                  <span>Online</span>
+                </div>
               </div>
             </div>
-          )}
-          
-          {/* Devices tab */}
-          {activeTab === 'devices' && (
-            <div className="space-y-4">
-              <div className="flex justify-between items-center">
-                <h3 className="font-medium text-sm">Connected Devices</h3>
-                <button className="text-blue-500 hover:text-blue-700 text-sm">
-                  <RefreshCw size={14} />
-                </button>
-              </div>
-              
-              {/* My device */}
-              <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
+            
+            {/* Connected peer devices */}
+            {Object.keys(connectedPeers.current).map(peerId => (
+              <div key={peerId} className="p-3 bg-gray-700 rounded-lg border border-gray-600">
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-md bg-blue-500 flex items-center justify-center text-white">
+                  <div className="w-8 h-8 rounded-md bg-orange-500 flex items-center justify-center text-white">
                     <HardDrive size={18} />
                   </div>
                   <div className="flex-1">
-                    <h3 className="font-medium text-sm">{activeDevice.name} (This device)</h3>
-                    <p className="text-xs text-gray-500">ID: {truncateHash(activeDevice.id)}</p>
+                    <h3 className="font-medium text-sm">Peer Device</h3>
+                    <p className="text-xs text-gray-400">ID: {truncateHash(peerId)}</p>
                   </div>
-                  <div className="flex items-center gap-1 text-xs bg-green-100 text-green-700 px-2 py-1 rounded">
+                  <div className="flex items-center gap-1 text-xs bg-green-900 text-green-400 px-2 py-1 rounded">
                     <div className="w-2 h-2 rounded-full bg-green-500"></div>
-                    <span>Online</span>
+                    <span>Connected</span>
                   </div>
                 </div>
               </div>
-              
-              {/* Connected peer devices */}
-              {Object.keys(connectedPeers.current).map(peerId => (
-                <div key={peerId} className="p-3 bg-gray-50 rounded-lg border border-gray-200">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-md bg-gray-500 flex items-center justify-center text-white">
-                      <HardDrive size={18} />
-                    </div>
-                    <div className="flex-1">
-                      <h3 className="font-medium text-sm">Peer Device</h3>
-                      <p className="text-xs text-gray-500">ID: {truncateHash(peerId)}</p>
-                    </div>
-                    <div className="flex items-center gap-1 text-xs bg-green-100 text-green-700 px-2 py-1 rounded">
-                      <div className="w-2 h-2 rounded-full bg-green-500"></div>
-                      <span>Connected</span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-              
-              {/* Offline devices - would be populated from historical connection data */}
-            </div>
-          )}
-        </div>
-        
-        {/* Main content */}
-        <div className="flex-1 overflow-y-auto">
-          {currentFolder ? (
-            <div className="p-6">
-              {/* Folder header */}
-              <div className="flex justify-between items-center mb-6">
-                <div className="flex items-center gap-3">
-                  <div className={`w-10 h-10 rounded-md flex items-center justify-center text-white`} style={{ backgroundColor: currentFolder.color }}>
-                    <FolderOpen size={22} />
-                  </div>
-                  <div>
-                    <h2 className="text-xl font-semibold">{currentFolder.name}</h2>
-                    <p className="text-sm text-gray-500">
-                      {formatFileSize(currentFolder.size)} • {currentFolder.devices} device{currentFolder.devices !== 1 ? 's' : ''}
-                      <span className="ml-2 text-xs text-gray-400">Last modified: {formatRelativeDate(currentFolder.modified)}</span>
-                    </p>
-                  </div>
-                </div>
-                
-                <div className="flex items-center gap-2">
-                  <button 
-                    className={`p-2 rounded-md ${currentFolder.syncEnabled ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-700'}`}
-                    onClick={() => toggleFolderSync(currentFolder.id)}
-                  >
-                    <RefreshCw size={18} />
-                  </button>
-                  <button 
-                    className="p-2 rounded-md bg-blue-100 text-blue-700"
-                    onClick={() => shareFolder(currentFolder)}
-                  >
-                    <Share2 size={18} />
-                  </button>
-                  <button 
-                    className="p-2 rounded-md bg-red-100 text-red-700"
-                    onClick={() => {
-                      if (window.confirm(`Are you sure you want to remove ${currentFolder.name}?`)) {
-                        deleteFolder(currentFolder.id);
-                      }
-                    }}
-                  >
-                    <Trash size={18} />
-                  </button>
-                </div>
-              </div>
-              
-              {/* Upload form */}
-              <div className="mb-6">
-                {uploadFormVisible ? (
-                  <div className="bg-white shadow-sm rounded-lg p-4">
-                    <div className="flex justify-between items-center mb-4">
-                      <h3 className="font-medium">Upload Files</h3>
-                      <button 
-                        className="text-gray-500 hover:text-gray-700"
-                        onClick={() => setUploadFormVisible(false)}
-                      >
-                        &times;
-                      </button>
-                    </div>
-                    
-                    <div className="mb-4">
-                      <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center relative">
-                        {selectedFiles.length > 0 ? (
-                          <div>
-                            <p className="font-medium">Selected Files:</p>
-                            <ul className="text-sm text-gray-600 mt-2">
-                              {selectedFiles.map((file, index) => (
-                                <li key={index}>{file.name} ({formatFileSize(file.size)})</li>
-                              ))}
-                            </ul>
-                          </div>
-                        ) : (
-                          <div className="flex flex-col items-center">
-                            <Upload size={32} className="text-gray-400 mb-2" />
-                            <p className="text-gray-500">Drag and drop files or click to browse</p>
-                          </div>
-                        )}
-                        <input 
-                          type="file" 
-                          onChange={handleFileUpload}
-                          multiple
-                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex gap-2">
-                    <button 
-                      className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium rounded-lg p-3 flex items-center justify-center gap-2"
-                      onClick={() => setUploadFormVisible(true)}
-                    >
-                      <Upload size={18} />
-                      Upload Files
-                    </button>
-                    
-                    <button 
-                      className="flex-1 bg-blue-50 hover:bg-blue-100 text-blue-700 font-medium rounded-lg p-3 flex items-center justify-center gap-2"
-                      onClick={() => addDefaultFilesToFolder(currentFolder.id)}
-                    >
-                      <Plus size={18} />
-                      Add Sample Files
-                    </button>
-                  </div>
-                )}
-              </div>
-              
-              {/* Files */}
-              <div className="bg-white shadow-sm rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b">
-                  <h3 className="font-medium">Files</h3>
-                </div>
-                
-                {folderFiles.length > 0 ? (
-                  <table className="w-full">
-                    <thead className="bg-gray-50 text-xs text-gray-500 uppercase">
-                      <tr>
-                        <th className="px-4 py-2 text-left font-medium">Name</th>
-                        <th className="px-4 py-2 text-left font-medium">Size</th>
-                        <th className="px-4 py-2 text-left font-medium">Modified</th>
-                        <th className="px-4 py-2 text-left font-medium">Version</th>
-                        <th className="px-4 py-2 text-left font-medium">Status</th>
-                        <th className="px-4 py-2 text-right font-medium">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {folderFiles.map(file => (
-                        <tr key={file.id} className="hover:bg-gray-50">
-                          <td className="px-4 py-3">
-                            <div className="flex items-center gap-2">
-                              {getFileTypeIcon(file)}
-                              <span className="font-medium text-sm">{file.name}</span>
-                            </div>
-                          </td>
-                          <td className="px-4 py-3 text-sm text-gray-500">{formatFileSize(file.size)}</td>
-                          <td className="px-4 py-3 text-sm text-gray-500">{formatRelativeDate(file.modified)}</td>
-                          <td className="px-4 py-3 text-sm text-gray-500">v{file.version}</td>
-                          <td className="px-4 py-3">
-                            <span className={`text-xs ${file.synced ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'} px-2 py-1 rounded`}>
-                              {file.synced ? 'Synced' : 'Pending'}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            <button 
-                              className="p-1 text-gray-500 hover:text-blue-500"
-                              onClick={() => downloadFile(file)}
-                            >
-                              <Download size={16} />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                ) : (
-                  <div className="py-8 text-center text-gray-500">
-                    <p>No files in this folder yet</p>
-                    <div className="flex justify-center gap-4 mt-4">
-                      <button 
-                        className="text-blue-500 hover:text-blue-700 text-sm font-medium"
-                        onClick={() => setUploadFormVisible(true)}
-                      >
-                        Upload files
-                      </button>
-                      <button 
-                        className="text-blue-500 hover:text-blue-700 text-sm font-medium"
-                        onClick={() => addDefaultFilesToFolder(currentFolder.id)}
-                      >
-                        Add sample files
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-              
-              {/* Blockchain Transactions */}
-              <div className="mt-6 bg-white shadow-sm rounded-lg overflow-hidden">
-                <div className="px-4 py-3 border-b flex justify-between items-center">
-                  <h3 className="font-medium">Blockchain Metadata</h3>
-                  <button className="text-xs text-blue-500 flex items-center gap-1">
-                    <ExternalLink size={12} />
-                    View on Explorer
-                  </button>
-                </div>
-                
-                {transactions.filter(tx => tx.fileInfo && tx.fileInfo.folderId === currentFolder.id).length > 0 ? (
-                  <div className="divide-y">
-                    {transactions
-                      .filter(tx => tx.fileInfo && tx.fileInfo.folderId === currentFolder.id)
-                      .slice(0, 5)
-                      .map((tx, index) => (
-                        <div key={index} className="p-4">
-                          <div className="flex justify-between items-start">
-                            <div>
-                              <p className="font-medium text-sm">{tx.fileInfo.name}</p>
-                              <p className="text-xs text-gray-500">{formatFileSize(tx.fileInfo.size)}</p>
-                            </div>
-                            <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded">
-                              {truncateHash(tx.hash)}
-                            </span>
-                          </div>
-                          <p className="text-xs text-gray-500 mt-1">
-                            {new Date(tx.timestamp).toLocaleString()}
-                          </p>
-                        </div>
-                      ))}
-                  </div>
-                ) : (
-                  <div className="py-8 text-center text-gray-500">
-                    <p>No blockchain transactions for this folder yet</p>
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="p-6 flex flex-col items-center justify-center h-full text-center">
-              <div className="mb-4 text-gray-400">
-                <FolderOpen size={64} />
-              </div>
-              <h2 className="text-xl font-semibold mb-2">No Folder Selected</h2>
-              <p className="text-gray-500 mb-6 max-w-md">Select a folder from the sidebar or create a new one to get started</p>
-              <div className="flex gap-4">
-                <button 
-                  className="bg-blue-500 text-white rounded-md py-2 px-4 font-medium"
-                  onClick={() => setNewFolderModal(true)}
-                >
-                  Add New Folder
-                </button>
-                <button 
-                  className="bg-gray-100 text-gray-700 rounded-md py-2 px-4 font-medium"
-                  onClick={() => {
-                    const key = prompt('Enter share key:');
-                    if (key) addFolderByKey(key);
-                  }}
-                >
-                  Connect to Shared Folder
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
       
-      {/* Sharing modal */}
-      {sharingModal.open && sharingModal.folder && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
-            <h3 className="text-lg font-semibold mb-4">Share "{sharingModal.folder.name}"</h3>
-            
-            <div className="mb-4">
-              <label className="block text-sm font-medium mb-1">Share Key</label>
-              <div className="flex">
-                <input
-                  type="text"
-                  value={sharingModal.folder.secretKey}
-                  readOnly
-                  className="flex-1 p-2 border rounded-l-md bg-gray-50"
-                />
-                <button
-                  onClick={() => copyShareKey(sharingModal.folder.secretKey)}
-                  className="bg-gray-100 border border-l-0 rounded-r-md p-2 px-3 hover:bg-gray-200"
+      {/* Main content */}
+      <div className="flex-1 overflow-y-auto bg-gray-900">
+        {currentFolder ? (
+          <div className="p-6">
+            {/* Folder header */}
+            <div className="flex justify-between items-center mb-6">
+              <div className="flex items-center gap-3">
+                <div className={`w-10 h-10 rounded-md flex items-center justify-center text-white`} style={{ backgroundColor: currentFolder.color }}>
+                  <FolderOpen size={22} />
+                </div>
+                <div>
+                  <h2 className="text-xl font-semibold">{currentFolder.name}</h2>
+                  <p className="text-sm text-gray-400">
+                    {formatFileSize(currentFolder.size)} • {currentFolder.devices} device{currentFolder.devices !== 1 ? 's' : ''}
+                    <span className="ml-2 text-xs text-gray-500">Last modified: {formatRelativeDate(currentFolder.modified)}</span>
+                  </p>
+                </div>
+              </div>
+              
+              <div className="flex items-center gap-2">
+                <button 
+                  className={`p-2 rounded-md ${currentFolder.syncEnabled ? 'bg-teal-900 text-teal-400' : 'bg-gray-700 text-gray-400'}`}
+                  onClick={() => toggleFolderSync(currentFolder.id)}
                 >
-                  <Copy size={18} />
+                  <RefreshCw size={18} />
+                </button>
+                <button 
+                  className="p-2 rounded-md bg-teal-900 text-teal-400"
+                  onClick={() => shareFolder(currentFolder)}
+                >
+                  <Share2 size={18} />
+                </button>
+                <button 
+                  className="p-2 rounded-md bg-red-900 text-red-400"
+                  onClick={() => {
+                    if (window.confirm(`Are you sure you want to remove ${currentFolder.name}?`)) {
+                      deleteFolder(currentFolder.id);
+                    }
+                  }}
+                >
+                  <Trash size={18} />
                 </button>
               </div>
-              <p className="text-xs text-gray-500 mt-1">
-                Share this key with others to give them access to this folder
-              </p>
             </div>
             
-            <div className="mb-4">
-              <label className="block text-sm font-medium mb-1">Permission</label>
-              <select 
-                className="w-full p-2 border rounded-md"
-                value={sharingModal.folder.shareMode}
+            {/* Upload form */}
+            <div className="mb-6">
+              {uploadFormVisible ? (
+                <div className="bg-gray-800 shadow-sm rounded-lg p-4">
+                  <div className="flex justify-between items-center mb-4">
+                    <h3 className="font-medium text-gray-200">Upload Files</h3>
+                    <button 
+                      className="text-gray-400 hover:text-gray-200"
+                      onClick={() => setUploadFormVisible(false)}
+                    >
+                      &times;
+                    </button>
+                  </div>
+                  
+                  <div className="mb-4">
+                    <div className="border-2 border-dashed border-gray-700 rounded-lg p-6 text-center relative">
+                      {selectedFiles.length > 0 ? (
+                        <div>
+                          <p className="font-medium text-gray-200">Selected Files:</p>
+                          <ul className="text-sm text-gray-400 mt-2">
+                            {selectedFiles.map((file, index) => (
+                              <li key={index}>{file.name} ({formatFileSize(file.size)})</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : (
+                        <div className="flex flex-col items-center">
+                          <Upload size={32} className="text-gray-500 mb-2" />
+                          <p className="text-gray-400">Drag and drop files or click to browse</p>
+                        </div>
+                      )}
+                      <input 
+                        type="file" 
+                        onChange={handleFileUpload}
+                        multiple
+                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <button 
+                    className="flex-1 bg-gray-800 hover:bg-gray-700 text-gray-200 font-medium rounded-lg p-3 flex items-center justify-center gap-2"
+                    onClick={() => setUploadFormVisible(true)}
+                  >
+                    <Upload size={18} />
+                    Upload Files
+                  </button>
+                  
+                  <button 
+                    className="flex-1 bg-teal-900 hover:bg-teal-800 text-teal-300 font-medium rounded-lg p-3 flex items-center justify-center gap-2"
+                    onClick={() => addDefaultFilesToFolder(currentFolder.id)}
+                  >
+                    <Plus size={18} />
+                    Add Sample Files
+                  </button>
+                </div>
+              )}
+            </div>
+            
+            {/* Files */}
+            <div className="bg-gray-800 shadow-sm rounded-lg overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-700">
+                <h3 className="font-medium text-gray-200">Files</h3>
+              </div>
+              
+              {folderFiles.length > 0 ? (
+                <table className="w-full">
+                  <thead className="bg-gray-900 text-xs text-gray-400 uppercase">
+                    <tr>
+                      <th className="px-4 py-2 text-left font-medium">Name</th>
+                      <th className="px-4 py-2 text-left font-medium">Size</th>
+                      <th className="px-4 py-2 text-left font-medium">Modified</th>
+                      <th className="px-4 py-2 text-left font-medium">Version</th>
+                      <th className="px-4 py-2 text-left font-medium">Status</th>
+                      <th className="px-4 py-2 text-right font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-700">
+                    {folderFiles.map(file => (
+                      <tr key={file.id} className="hover:bg-gray-700">
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            {getFileTypeIcon(file)}
+                            <span className="font-medium text-sm text-gray-200">{file.name}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-sm text-gray-400">{formatFileSize(file.size)}</td>
+                        <td className="px-4 py-3 text-sm text-gray-400">{formatRelativeDate(file.modified)}</td>
+                        <td className="px-4 py-3 text-sm text-gray-400">v{file.version}</td>
+                        <td className="px-4 py-3">
+                          <span className={`text-xs ${file.synced ? 'bg-green-900 text-green-400' : 'bg-orange-900 text-orange-400'} px-2 py-1 rounded`}>
+                            {file.synced ? 'Synced' : 'Pending'}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <button 
+                            className="p-1 text-gray-400 hover:text-teal-400"
+                            onClick={() => downloadFile(file)}
+                          >
+                            <Download size={16} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <div className="py-8 text-center text-gray-400">
+                  <p>No files in this folder yet</p>
+                  <div className="flex justify-center gap-4 mt-4">
+                    <button 
+                      className="text-teal-400 hover:text-teal-300 text-sm font-medium"
+                      onClick={() => setUploadFormVisible(true)}
+                    >
+                      Upload files
+                    </button>
+                    <button 
+                      className="text-teal-400 hover:text-teal-300 text-sm font-medium"
+                      onClick={() => addDefaultFilesToFolder(currentFolder.id)}
+                    >
+                      Add sample files
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+            
+            {/* Blockchain Transactions */}
+            <div className="mt-6 bg-gray-800 shadow-sm rounded-lg overflow-hidden">
+              <div className="px-4 py-3 border-b border-gray-700 flex justify-between items-center">
+                <h3 className="font-medium text-gray-200">Blockchain Metadata</h3>
+                <button className="text-xs text-teal-400 flex items-center gap-1">
+                  <ExternalLink size={12} />
+                  View on Explorer
+                </button>
+              </div>
+              
+              {transactions.filter(tx => tx.fileInfo && tx.fileInfo.folderId === currentFolder.id).length > 0 ? (
+                <div className="divide-y divide-gray-700">
+                  {transactions
+                    .filter(tx => tx.fileInfo && tx.fileInfo.folderId === currentFolder.id)
+                    .slice(0, 5)
+                    .map((tx, index) => (
+                      <div key={index} className="p-4">
+                        <div className="flex justify-between items-start">
+                          <div>
+                            <p className="font-medium text-sm text-gray-200">{tx.fileInfo.name}</p>
+                            <p className="text-xs text-gray-400">{formatFileSize(tx.fileInfo.size)}</p>
+                          </div>
+                          <span className="text-xs bg-teal-900 text-teal-400 px-2 py-1 rounded">
+                            {truncateHash(tx.hash)}
+                          </span>
+                        </div>
+                        <p className="text-xs text-gray-400 mt-1">
+                          {new Date(tx.timestamp).toLocaleString()}
+                        </p>
+                      </div>
+                    ))}
+                </div>
+              ) : (
+                <div className="py-8 text-center text-gray-400">
+                  <p>No blockchain transactions for this folder yet</p>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="p-6 flex flex-col items-center justify-center h-full text-center">
+            <div className="mb-4 text-gray-500">
+              <FolderOpen size={64} />
+            </div>
+            <h2 className="text-xl font-semibold mb-2 text-gray-200">No Folder Selected</h2>
+            <p className="text-gray-400 mb-6 max-w-md">Select a folder from the sidebar or create a new one to get started</p>
+            <div className="flex gap-4">
+              <button 
+                className="bg-teal-600 hover:bg-teal-500 text-white rounded-md py-2 px-4 font-medium"
+                onClick={() => setNewFolderModal(true)}
+              >
+                Add New Folder
+              </button>
+              <button 
+                className="bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-md py-2 px-4 font-medium"
+                onClick={() => {
+                  const key = prompt('Enter share key:');
+                  if (key) addFolderByKey(key);
+                }}
+              >
+                Connect to Shared Folder
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+    
+    {/* Sharing modal */}
+    {sharingModal.open && sharingModal.folder && (
+      <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
+        <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6">
+          <h3 className="text-lg font-semibold mb-4 text-gray-200">Share "{sharingModal.folder.name}"</h3>
+          
+          <div className="mb-4">
+            <label className="block text-sm font-medium mb-1 text-gray-300">Share Key</label>
+            <div className="flex">
+              <input
+                type="text"
+                value={sharingModal.folder.secretKey}
+                readOnly
+                className="flex-1 p-2 border border-gray-600 rounded-l-md bg-gray-700 text-gray-200"
+              />
+              <button
+                onClick={() => copyShareKey(sharingModal.folder.secretKey)}
+                className="bg-gray-600 border border-gray-600 border-l-0 rounded-r-md p-2 px-3 hover:bg-gray-500 text-gray-200"
+              >
+                <Copy size={18} />
+              </button>
+            </div>
+            <p className="text-xs text-gray-400 mt-1">
+              Share this key with others to give them access to this folder
+            </p>
+          </div>
+          
+          <div className="mb-4">
+            <label className="block text-sm font-medium mb-1 text-gray-300">Permission</label>
+            <select 
+              className="w-full p-2 border border-gray-600 rounded-md bg-gray-700 text-gray-200"
+              value={sharingModal.folder.shareMode}
+              onChange={(e) => {
+                setSyncFolders(prev => prev.map(folder => 
+                  folder.id === sharingModal.folder.id 
+                    ? { ...folder, shareMode: e.target.value }
+                    : folder
+                ));
+                setSharingModal(prev => ({
+                  ...prev,
+                  folder: { ...prev.folder, shareMode: e.target.value }
+                }));
+              }}
+            >
+              <option value="read-only">Read Only</option>
+              <option value="read-write">Read & Write</option>
+            </select>
+          </div>
+          
+          <div className="mb-6">
+            <label className="flex items-center">
+              <input 
+                type="checkbox"
+                checked={sharingModal.folder.encrypted}
                 onChange={(e) => {
                   setSyncFolders(prev => prev.map(folder => 
                     folder.id === sharingModal.folder.id 
-                      ? { ...folder, shareMode: e.target.value }
+                      ? { ...folder, encrypted: e.target.checked }
                       : folder
                   ));
                   setSharingModal(prev => ({
                     ...prev,
-                    folder: { ...prev.folder, shareMode: e.target.value }
+                    folder: { ...prev.folder, encrypted: e.target.checked }
                   }));
                 }}
+                className="mr-2"
+              />
+              <span className="text-sm text-gray-300">Encrypt data transfers</span>
+            </label>
+          </div>
+          
+          <div className="flex justify-end gap-2">
+            <button 
+              className="px-4 py-2 border border-gray-600 rounded-md text-gray-300 hover:bg-gray-700"
+              onClick={() => setSharingModal({ open: false, folder: null })}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+    
+    {/* New folder modal */}
+    {newFolderModal && (
+      <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center p-4 z-50">
+        <div className="bg-gray-800 rounded-lg shadow-xl max-w-md w-full p-6">
+          <h3 className="text-lg font-semibold mb-4 text-gray-200">Add New Folder</h3>
+          
+          <form onSubmit={(e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const folderData = {
+              name: formData.get('name'),
+              path: formData.get('path'),
+              shared: formData.get('shared') === 'on',
+              shareMode: formData.get('shareMode') || 'read-write',
+              encrypted: formData.get('encrypted') === 'on',
+              color: formData.get('color')
+            };
+            createSyncFolder(folderData);
+          }}>
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-1 text-gray-300" htmlFor="name">Folder Name</label>
+              <input
+                type="text"
+                id="name"
+                name="name"
+                required
+                className="w-full p-2 border border-gray-600 rounded-md bg-gray-700 text-gray-200"
+                placeholder="My Folder"
+              />
+            </div>
+            
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-1 text-gray-300" htmlFor="path">Folder Path (optional)</label>
+              <input
+                type="text"
+                id="path"
+                name="path"
+                className="w-full p-2 border border-gray-600 rounded-md bg-gray-700 text-gray-200"
+                placeholder="/path/to/folder"
+              />
+              <p className="text-xs text-gray-400 mt-1">Leave empty to generate automatically</p>
+            </div>
+            
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-1 text-gray-300" htmlFor="color">Color</label>
+              <select
+                id="color"
+                name="color"
+                className="w-full p-2 border border-gray-600 rounded-md bg-gray-700 text-gray-200"
+              >
+                <option value="#4F46E5">Blue</option>
+                <option value="#10B981">Green</option>
+                <option value="#F59E0B">Yellow</option>
+                <option value="#EF4444">Red</option>
+                <option value="#8B5CF6">Purple</option>
+                <option value="#EC4899">Pink</option>
+                <option value="#06B6D4">Teal</option>
+                <option value="#F97316">Orange</option>
+              </select>
+            </div>
+            
+            <div className="mb-4">
+              <label className="flex items-center">
+                <input 
+                  type="checkbox"
+                  name="shared"
+                  className="mr-2"
+                />
+                <span className="text-sm text-gray-300">Share this folder</span>
+              </label>
+            </div>
+            
+            <div className="mb-4">
+              <label className="block text-sm font-medium mb-1 text-gray-300" htmlFor="shareMode">Share Permission</label>
+              <select 
+                id="shareMode"
+                name="shareMode"
+                className="w-full p-2 border border-gray-600 rounded-md bg-gray-700 text-gray-200"
               >
                 <option value="read-only">Read Only</option>
                 <option value="read-write">Read & Write</option>
@@ -3766,167 +3881,51 @@ const addFolderByKey = async (secretKey) => {
               <label className="flex items-center">
                 <input 
                   type="checkbox"
-                  checked={sharingModal.folder.encrypted}
-                  onChange={(e) => {
-                    setSyncFolders(prev => prev.map(folder => 
-                      folder.id === sharingModal.folder.id 
-                        ? { ...folder, encrypted: e.target.checked }
-                        : folder
-                    ));
-                    setSharingModal(prev => ({
-                      ...prev,
-                      folder: { ...prev.folder, encrypted: e.target.checked }
-                    }));
-                  }}
+                  name="encrypted"
+                  defaultChecked={true}
                   className="mr-2"
                 />
-                <span className="text-sm">Encrypt data transfers</span>
+                <span className="text-sm text-gray-300">Encrypt data transfers</span>
               </label>
             </div>
             
             <div className="flex justify-end gap-2">
               <button 
-                className="px-4 py-2 border rounded-md"
-                onClick={() => setSharingModal({ open: false, folder: null })}
+                type="button"
+                className="px-4 py-2 border border-gray-600 rounded-md text-gray-300 hover:bg-gray-700"
+                onClick={() => setNewFolderModal(false)}
               >
-                Close
+                Cancel
+              </button>
+              <button 
+                type="submit"
+                className="px-4 py-2 bg-teal-600 text-white rounded-md hover:bg-teal-500"
+              >
+                Create
               </button>
             </div>
-          </div>
+          </form>
         </div>
-      )}
-      
-      {/* New folder modal */}
-      {newFolderModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
-            <h3 className="text-lg font-semibold mb-4">Add New Folder</h3>
-            
-            <form onSubmit={(e) => {
-              e.preventDefault();
-              const formData = new FormData(e.target);
-              const folderData = {
-                name: formData.get('name'),
-                path: formData.get('path'),
-                shared: formData.get('shared') === 'on',
-                shareMode: formData.get('shareMode') || 'read-write',
-                encrypted: formData.get('encrypted') === 'on',
-                color: formData.get('color')
-              };
-              createSyncFolder(folderData);
-            }}>
-              <div className="mb-4">
-                <label className="block text-sm font-medium mb-1" htmlFor="name">Folder Name</label>
-                <input
-                  type="text"
-                  id="name"
-                  name="name"
-                  required
-                  className="w-full p-2 border rounded-md"
-                  placeholder="My Folder"
-                />
-              </div>
-              
-              <div className="mb-4">
-                <label className="block text-sm font-medium mb-1" htmlFor="path">Folder Path (optional)</label>
-                <input
-                  type="text"
-                  id="path"
-                  name="path"
-                  className="w-full p-2 border rounded-md"
-                  placeholder="/path/to/folder"
-                />
-                <p className="text-xs text-gray-500 mt-1">Leave empty to generate automatically</p>
-              </div>
-              
-              <div className="mb-4">
-                <label className="block text-sm font-medium mb-1" htmlFor="color">Color</label>
-                <select
-                  id="color"
-                  name="color"
-                  className="w-full p-2 border rounded-md"
-                >
-                  <option value="#4F46E5">Blue</option>
-                  <option value="#10B981">Green</option>
-                  <option value="#F59E0B">Yellow</option>
-                  <option value="#EF4444">Red</option>
-                  <option value="#8B5CF6">Purple</option>
-                  <option value="#EC4899">Pink</option>
-                </select>
-              </div>
-              
-              <div className="mb-4">
-                <label className="flex items-center">
-                  <input 
-                    type="checkbox"
-                    name="shared"
-                    className="mr-2"
-                  />
-                  <span className="text-sm">Share this folder</span>
-                </label>
-              </div>
-              
-              <div className="mb-4">
-                <label className="block text-sm font-medium mb-1" htmlFor="shareMode">Share Permission</label>
-                <select 
-                  id="shareMode"
-                  name="shareMode"
-                  className="w-full p-2 border rounded-md"
-                >
-                  <option value="read-only">Read Only</option>
-                  <option value="read-write">Read & Write</option>
-                </select>
-              </div>
-              
-              <div className="mb-6">
-                <label className="flex items-center">
-                  <input 
-                    type="checkbox"
-                    name="encrypted"
-                    defaultChecked={true}
-                    className="mr-2"
-                  />
-                  <span className="text-sm">Encrypt data transfers</span>
-                </label>
-              </div>
-              
-              <div className="flex justify-end gap-2">
-                <button 
-                  type="button"
-                  className="px-4 py-2 border rounded-md"
-                  onClick={() => setNewFolderModal(false)}
-                >
-                  Cancel
-                </button>
-                <button 
-                  type="submit"
-                  className="px-4 py-2 bg-blue-500 text-white rounded-md"
-                >
-                  Create
-                </button>
-              </div>
-            </form>
-          </div>
+      </div>
+    )}
+    
+    {/* Notification toast */}
+    {notification.show && (
+      <div className="fixed bottom-4 right-4 max-w-md">
+        <div className={`rounded-md shadow-lg p-4 flex items-center gap-3 ${
+          notification.type === 'success' ? 'bg-green-800 text-green-200 border-l-4 border-green-500' :
+          notification.type === 'error' ? 'bg-red-800 text-red-200 border-l-4 border-red-500' :
+          'bg-blue-800 text-blue-200 border-l-4 border-blue-500'
+        }`}>
+          {notification.type === 'success' && <Check size={20} />}
+          {notification.type === 'error' && <span className="text-xl">⚠️</span>}
+          {notification.type === 'info' && <span className="text-xl">ℹ️</span>}
+          <p>{notification.message}</p>
         </div>
-      )}
-      
-      {/* Notification toast */}
-      {notification.show && (
-        <div className="fixed bottom-4 right-4 max-w-md">
-          <div className={`rounded-md shadow-lg p-4 flex items-center gap-3 ${
-            notification.type === 'success' ? 'bg-green-50 text-green-800 border-l-4 border-green-500' :
-            notification.type === 'error' ? 'bg-red-50 text-red-800 border-l-4 border-red-500' :
-            'bg-blue-50 text-blue-800 border-l-4 border-blue-500'
-          }`}>
-            {notification.type === 'success' && <Check size={20} />}
-            {notification.type === 'error' && <span className="text-xl">⚠️</span>}
-            {notification.type === 'info' && <span className="text-xl">ℹ️</span>}
-            <p>{notification.message}</p>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+      </div>
+    )}
+  </div>
+);
 };
 
 export default BlockSyncApp;

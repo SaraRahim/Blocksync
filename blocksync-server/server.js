@@ -19,6 +19,8 @@ const io = new Server(server, {
   }
 });
 
+const announceTimestamps = new Map(); // Rate limiter for announce events
+
 // Store connected users and their devices
 const connectedUsers = new Map();
 
@@ -58,6 +60,14 @@ io.on('connection', (socket) => {
   
   // Handle user announcement (with folders they have)
   socket.on('announce', (data) => {
+    const now = Date.now();
+    const lastAnnounce = announceTimestamps.get(socket.id) || 0;
+    if (now - lastAnnounce < 5000) {
+      console.log(`Throttling 'announce' from ${socket.id}`);
+      return;
+    }
+    announceTimestamps.set(socket.id, now);
+    
     console.log(`Announcement from ${userId}:`, data);
     
     // Update user's device info with the folders they have
