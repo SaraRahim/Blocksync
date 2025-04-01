@@ -1095,10 +1095,14 @@ send: msg => {
         try {
           // Parse the data - handle both string and binary formats
           if (raw instanceof ArrayBuffer || raw instanceof Uint8Array) {
-            try {
-              // Try to decode as text and parse as JSON
-              const text = new TextDecoder().decode(raw);
+            // Instead of your existing try/catch blocks, use the direct binary handling
+            // This simplifies the binary data handling
+            const handled = handleBinaryData(raw, peerId);
+            
+            // Only if not handled as binary, try to parse as JSON
+            if (!handled) {
               try {
+                const text = new TextDecoder().decode(raw);
                 const message = JSON.parse(text);
                 console.log(`📩 Received message from ${peerId}, type: ${message.type}`);
                 
@@ -1107,16 +1111,13 @@ send: msg => {
                 let handled = false;
                 
                 if (peerObj && peerObj.messageHandlers && peerObj.messageHandlers.size > 0) {
-                  // Create an array of handlers to avoid modification during iteration
                   const handlers = Array.from(peerObj.messageHandlers.values());
                   
                   for (const handlerInfo of handlers) {
                     if (handlerInfo.type === message.type) {
                       try {
-                        // Call the handler
                         handled = handlerInfo.handler(message) || handled;
                         
-                        // If this is a one-time handler, remove it after successful execution
                         if (handlerInfo.oneTime) {
                           peerObj.removeMessageHandler(handlerInfo.id);
                         }
@@ -1127,17 +1128,12 @@ send: msg => {
                   }
                 }
                 
-                // If no custom handler processed this message, use the default handler
                 if (!handled) {
                   handlePeerMessage(message, peerId);
                 }
-              } catch (e) {
-                // If JSON parsing fails, treat as binary data
-                handleBinaryData(raw, peerId);
+              } catch (err) {
+                console.warn(`Error parsing binary data as text: ${err.message}`);
               }
-            } catch (e) {
-              // If decoding fails, this is definitely binary data
-              handleBinaryData(raw, peerId);
             }
           } else if (typeof raw === 'string') {
             // Parse string as JSON
@@ -1145,7 +1141,7 @@ send: msg => {
               const message = JSON.parse(raw);
               console.log(`📩 Received string message from ${peerId}, type: ${message.type}`);
               
-              // Process with handlers or default handler (same logic as above)
+              // Process with handlers or default handler
               const peerObj = peers.current[peerId];
               let handled = false;
               
@@ -1560,7 +1556,7 @@ const handlePeerMessage = (message, peerId) => {
     }
   };
   
-// Handle binary data (file chunks) from peers
+// 4. Modify your handleBinaryData function to better handle file chunks
 const handleBinaryData = (data, peerId) => {
   console.log(`📦 Received binary data from peer ${peerId}, size: ${data.byteLength || 'unknown'} bytes`);
   
@@ -1576,18 +1572,26 @@ const handleBinaryData = (data, peerId) => {
     pendingRequest.status = 'received';
     pendingRequest.data = data;
     
-    // Remove the message handler
-    const peerObj = peers.current[peerId];
-    if (peerObj && peerObj.removeMessageHandler && pendingRequest.handlerId) {
-      peerObj.removeMessageHandler(pendingRequest.handlerId);
+    // Clean up if there's a cleanup function
+    if (pendingRequest.cleanup) {
+      pendingRequest.cleanup();
+    } else {
+      // Otherwise just remove the message handler
+      const peerObj = peers.current[peerId];
+      if (peerObj && peerObj.removeMessageHandler && pendingRequest.handlerId) {
+        peerObj.removeMessageHandler(pendingRequest.handlerId);
+      }
     }
     
     // Resolve the promise
     pendingRequest.resolve(data);
+    return true;
   } else {
     console.log('Received unexpected binary data from peer:', peerId);
+    return false;
   }
 };
+
   
 // Handle file request from a peer
 const handleFileRequest = async (request, peerId) => {
@@ -1902,12 +1906,26 @@ const broadcastFolderAddedByKey = (folder, files) => {
     return successCount;
   };
   
-// Request a file chunk from a peer
+// 3. Replace your requestFileChunk function with this one
 const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folderId) => {
+  console.log(`Requesting file chunk from peer ${peerWrapper.peerId}: file=${fileId}, folder=${folderId}, range=${chunkStart}-${chunkEnd}`);
+  
   return new Promise((resolve, reject) => {
     // Generate a unique request ID
     const requestId = 'req_' + Math.random().toString(36).substr(2, 9);
-    let handlerId = null; // Define handlerId variable here
+    let handlerId = null;
+    let binaryDataTimeout = null;
+    
+    // Function to cleanup resources
+    const cleanup = () => {
+      if (peerWrapper && peerWrapper.removeMessageHandler && handlerId) {
+        peerWrapper.removeMessageHandler(handlerId);
+      }
+      if (binaryDataTimeout) {
+        clearTimeout(binaryDataTimeout);
+      }
+      delete pendingRequests.current[requestId];
+    };
     
     // Send the request
     try {
@@ -1918,20 +1936,24 @@ const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folde
           
           if (error) {
             // The request failed
-            peerWrapper.removeMessageHandler(handlerId);
+            cleanup();
             reject(new Error(error));
             return true; // Mark as handled
           } else if (success) {
-            // The chunk data will come separately as binary data
             console.log(`Received FILE_RESPONSE success for ${requestId}, awaiting binary chunk`);
             
-            // We'll now wait for the binary data
-            // The listener stays active until timeout or we get binary data in handleBinaryData
+            // Set a timeout for receiving the binary data
+            binaryDataTimeout = setTimeout(() => {
+              console.error(`Timeout waiting for binary data for request ${requestId}`);
+              cleanup();
+              reject(new Error('Timeout waiting for binary data'));
+            }, 20000); // 20 second timeout
+            
             return true; // Mark as handled
           }
         }
         return false; // Not handled
-      }, 30000); // 30 second timeout
+      }, 40000); // 40 second timeout (longer than the binary data timeout)
       
       // Store this request so we can match binary data to it
       pendingRequests.current[requestId] = {
@@ -1945,11 +1967,12 @@ const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folde
         peerId: peerWrapper.peerId,
         resolve,
         reject,
-        handlerId
+        handlerId,
+        cleanup
       };
       
       // Send the request message
-      peerWrapper.send({
+      const success = peerWrapper.send({
         type: 'FILE_REQUEST',
         data: {
           requestId,
@@ -1959,35 +1982,63 @@ const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folde
           chunkEnd
         }
       });
-    } catch (error) {
-      if (peerWrapper && peerWrapper.removeMessageHandler && handlerId) {
-        peerWrapper.removeMessageHandler(handlerId);
+      
+      if (!success) {
+        throw new Error('Failed to send request to peer');
       }
-      delete pendingRequests.current[requestId];
+      
+      console.log(`File chunk request sent to peer ${peerWrapper.peerId}`);
+    } catch (error) {
+      cleanup();
       reject(error);
     }
   });
 };
+
   
-// Download a file from peers
+// 2. Replace your downloadFileFromPeers function with this one
 const downloadFileFromPeers = async (file, folder) => {
+  console.log(`Starting downloadFileFromPeers for file:`, file.name);
+  
   // Check if the file is already available locally
   if (file.synced && file.url) {
+    console.log(`File already available locally, returning`);
     return file;
   }
   
-  // Check if we have peers that have this file
-  if (!file.availableFrom || file.availableFrom.length === 0) {
-    throw new Error('No peers have this file');
+  // Check if we have connected peers
+  const connectedPeerIds = Object.keys(connectedPeers.current);
+  if (connectedPeerIds.length === 0) {
+    console.error('No connected peers available');
+    throw new Error('No connected peers available');
   }
   
-  // Use the first available peer
-  const peerId = file.availableFrom[0];
-  const peer = connectedPeers.current[peerId];
+  // Determine which peer to use
+  let peerId;
   
+  // First check if any of the availableFrom peers are actually connected
+  if (file.availableFrom && file.availableFrom.length > 0) {
+    const availablePeer = file.availableFrom.find(id => connectedPeers.current[id]);
+    if (availablePeer) {
+      peerId = availablePeer;
+      console.log(`Using specified peer ${peerId} from availableFrom list`);
+    } else {
+      console.log(`None of the specified peers are connected, using first available peer`);
+      peerId = connectedPeerIds[0];
+    }
+  } else {
+    // If no specific peers are listed, use the first connected peer
+    peerId = connectedPeerIds[0];
+    console.log(`No specific peers listed, using first available peer: ${peerId}`);
+  }
+  
+  const peer = connectedPeers.current[peerId];
   if (!peer) {
+    console.error(`Peer connection not available for ${peerId}`);
     throw new Error('Peer connection not available');
   }
+  
+  console.log(`Using peer ${peerId} to download file ${file.name} from folder ${folder.id}`);
   
   // Start the download process
   try {
@@ -1998,73 +2049,133 @@ const downloadFileFromPeers = async (file, folder) => {
       status: 'starting'
     });
     
-    // Request file metadata first
-    const metadataResponse = await peer.requestFile(file.id, folder.id, 0, 0);
+    // Enhanced debugging for the peer connection
+    console.log(`Peer connection status:`, {
+      peerId,
+      status: peer.status,
+      dataChannelState: peer.dataChannel ? peer.dataChannel.readyState : 'none',
+      isReady: peer.isReady || false
+    });
     
-    // The response should include the total file size
-    const totalSize = metadataResponse.totalSize || file.size;
-    const chunks = Math.ceil(totalSize / chunkSize);
+    // Wait for the peer to be fully ready before proceeding
+    if (!peer.isReady) {
+      console.log(`Waiting for peer connection to be fully ready...`);
+      await new Promise((resolve) => {
+        // Wait for up to 3 seconds for the connection to stabilize
+        const maxWait = 3000;
+        const startTime = Date.now();
+        
+        const checkReady = () => {
+          if (peer.isReady) {
+            resolve();
+          } else if (Date.now() - startTime > maxWait) {
+            resolve(); // Proceed anyway after timeout
+          } else {
+            setTimeout(checkReady, 100);
+          }
+        };
+        
+        checkReady();
+      });
+    }
     
-    console.log(`Downloading file ${file.name} (${formatFileSize(totalSize)}) in ${chunks} chunks`);
+    console.log(`Requesting file metadata for ${file.id} from folder ${folder.id}`);
+    
+    // First, try to fetch just the first byte to get metadata
+    let fileSize;
+    try {
+      // Request just 1 byte to get the file metadata
+      console.log("Requesting metadata chunk");
+      const metadataResponse = await peer.requestFile(file.id, folder.id, 0, 1);
+      console.log(`Got metadata response:`, metadataResponse);
+      fileSize = metadataResponse.totalSize || file.size || 0;
+    } catch (err) {
+      console.warn(`Failed to get metadata via requestFile, using file.size: ${err.message}`);
+      fileSize = file.size || 2048000; // Default to 2MB if no size available
+    }
+    
+    if (!fileSize || fileSize <= 0) {
+      console.warn(`Invalid file size (${fileSize}), using default size`);
+      fileSize = 2048000; // Default to 2MB
+    }
+    
+    console.log(`Determined file size: ${fileSize} bytes`);
+    
+    // Calculate chunks
+    const chunks = Math.ceil(fileSize / chunkSize);
+    
+    console.log(`Downloading file ${file.name} (${formatFileSize(fileSize)}) in ${chunks} chunks`);
     
     // Initialize array buffer to store the full file
-    const fileData = new Uint8Array(totalSize);
+    const fileData = new Uint8Array(fileSize);
     
     // Download the chunks
     let downloaded = 0;
-    const concurrentRequests = 3; // Number of chunks to download concurrently
+    const maxConcurrentRequests = 1; // Reduced to 1 to prevent connection issues
     
     // Process chunks in batches
-    for (let i = 0; i < chunks; i += concurrentRequests) {
+    for (let i = 0; i < chunks; i += maxConcurrentRequests) {
+      console.log(`Processing chunk batch ${i + 1} / ${chunks}`);
       const chunkPromises = [];
       
       // Create promises for concurrent chunk downloads
-      for (let j = 0; j < concurrentRequests && i + j < chunks; j++) {
+      for (let j = 0; j < maxConcurrentRequests && i + j < chunks; j++) {
         const chunkIndex = i + j;
         const chunkStart = chunkIndex * chunkSize;
-        const chunkEnd = Math.min(chunkStart + chunkSize, totalSize);
+        const chunkEnd = Math.min(chunkStart + chunkSize, fileSize);
         
-        chunkPromises.push(
-          peer.requestFile(file.id, folder.id, chunkStart, chunkEnd)
-            .then(chunkData => {
-              // Ensure we received binary data
-              if (!(chunkData instanceof ArrayBuffer) && !(chunkData instanceof Uint8Array)) {
-                throw new Error('Received non-binary data for file chunk');
-              }
-              
-              // Convert to Uint8Array if needed
-              const chunkUint8 = chunkData instanceof ArrayBuffer ? 
-                new Uint8Array(chunkData) : chunkData;
-              
-              // Store the chunk at the correct position in the full file data
-              fileData.set(chunkUint8, chunkStart);
-              
-              downloaded += chunkUint8.byteLength;
-              
-              // Update progress
-              setDownloadProgress({
-                fileId: file.id,
-                progress: Math.round((downloaded / totalSize) * 100),
-                status: 'downloading'
-              });
-              
-              return chunkData;
-            })
-            .catch(error => {
-              console.error(`Error downloading chunk ${chunkIndex}:`, error);
-              throw error;
-            })
-        );
+        console.log(`Requesting chunk ${chunkIndex+1}/${chunks} (${chunkStart}-${chunkEnd})`);
+        
+        const chunkPromise = peer.requestFile(file.id, folder.id, chunkStart, chunkEnd)
+          .then(chunkData => {
+            // Ensure we received binary data
+            if (!(chunkData instanceof ArrayBuffer) && !(chunkData instanceof Uint8Array)) {
+              console.error(`Received non-binary data for chunk ${chunkIndex}:`, chunkData);
+              throw new Error('Received non-binary data for file chunk');
+            }
+            
+            // Convert to Uint8Array if needed
+            const chunkUint8 = chunkData instanceof ArrayBuffer ? 
+              new Uint8Array(chunkData) : chunkData;
+            
+            console.log(`Received chunk ${chunkIndex+1} successfully, size: ${chunkUint8.byteLength} bytes`);
+            
+            // Store the chunk at the correct position in the full file data
+            fileData.set(chunkUint8, chunkStart);
+            
+            downloaded += chunkUint8.byteLength;
+            
+            // Update progress
+            setDownloadProgress({
+              fileId: file.id,
+              progress: Math.round((downloaded / fileSize) * 100),
+              status: 'downloading'
+            });
+            
+            return chunkData;
+          })
+          .catch(error => {
+            console.error(`Error downloading chunk ${chunkIndex}:`, error);
+            throw new Error(`Chunk ${chunkIndex} download failed: ${error.message || 'Unknown error'}`);
+          });
+        
+        chunkPromises.push(chunkPromise);
       }
       
       // Wait for this batch of chunks
       await Promise.all(chunkPromises);
+      
+      // Brief pause between batches to prevent overwhelming the connection
+      await new Promise(resolve => setTimeout(resolve, 200));
     }
     
     console.log(`Download complete for ${file.name}, creating blob`);
     
     // Create a blob from the file data
-    const blob = new Blob([fileData], { type: getMimeTypeFromFileName(file.name) });
+    const mimeType = getMimeTypeFromFileName(file.name) || 'application/octet-stream';
+    console.log(`Using MIME type: ${mimeType}`);
+    
+    const blob = new Blob([fileData], { type: mimeType });
     const fileUrl = URL.createObjectURL(blob);
     
     // Update file in state
@@ -2072,7 +2183,7 @@ const downloadFileFromPeers = async (file, folder) => {
       ...file,
       url: fileUrl,
       synced: true,
-      size: totalSize
+      size: fileSize
     };
     
     // Update the folder in state
@@ -2107,7 +2218,7 @@ const downloadFileFromPeers = async (file, folder) => {
       sender: peerId,
       fileInfo: {
         name: file.name,
-        size: totalSize,
+        size: fileSize,
         type: file.type,
         infoHash: file.id,
         folderId: folder.id
@@ -2123,6 +2234,8 @@ const downloadFileFromPeers = async (file, folder) => {
       status: 'complete'
     });
     
+    console.log(`File ${file.name} downloaded successfully`);
+    
     // Return the updated file
     return updatedFile;
   } catch (error) {
@@ -2137,6 +2250,7 @@ const downloadFileFromPeers = async (file, folder) => {
     throw error;
   }
 };
+
   
   // Add a folder from peer information
   const addFolderFromPeer = (folderInfo, peerId) => {
@@ -3289,44 +3403,66 @@ const addFolderByKey = async (secretKey) => {
     showNotification(`${files.length} file${files.length !== 1 ? 's' : ''} added successfully`, 'success');
   };
   
-  // Download a file
-  const downloadFile = (file) => {
-    if (file.url) {
-      // If we have a direct URL (from browser storage), use it
-      const a = document.createElement('a');
-      a.href = file.url;
-      a.download = file.name;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      
-      showNotification(`File "${file.name}" downloaded`, 'success');
-    } else if (file.synced === false && file.availableFrom && file.availableFrom.length > 0) {
-      // If file is not synced but peers have it, download from peers
-      showNotification('Downloading file from peers...', 'info');
-      
-      // Start the download process in background
-      downloadFileFromPeers(file, currentFolder)
-        .then(downloadedFile => {
-          showNotification(`File "${file.name}" downloaded from peer`, 'success');
-          
-          // Create a direct download link
-          const a = document.createElement('a');
-          a.href = downloadedFile.url;
-          a.download = file.name;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-        })
-        .catch(error => {
-          console.error('Error downloading file from peers:', error);
-          showNotification(`Failed to download file: ${error.message}`, 'error');
-        });
-    } else {
-      // File not available locally or from peers, show error
-      showNotification('File not available', 'error');
+  // 1. Replace your downloadFile function with this one
+const downloadFile = (file) => {
+  console.log(`Attempting to download file:`, file);
+  
+  if (file.url) {
+    // If we have a direct URL (from browser storage), use it
+    console.log(`File has URL, downloading directly: ${file.name}`);
+    const a = document.createElement('a');
+    a.href = file.url;
+    a.download = file.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    
+    showNotification(`File "${file.name}" downloaded`, 'success');
+  } else {
+    // For files without URL, try to download from any available peer
+    console.log(`File needs to be downloaded from peers: ${file.name}`);
+    
+    // Get all connected peers
+    const connectedPeerIds = Object.keys(connectedPeers.current);
+    console.log(`Currently connected peers: ${connectedPeerIds.length}`, connectedPeerIds);
+    
+    if (connectedPeerIds.length === 0) {
+      showNotification('No peers available to download file', 'error');
+      return;
     }
-  };
+    
+    // Use the first connected peer
+    const peerId = connectedPeerIds[0];
+    console.log(`Will attempt to download from peer: ${peerId}`);
+    
+    showNotification('Downloading file from peers...', 'info');
+    
+    // Create a modified file object with the available peer
+    const downloadableFile = {
+      ...file,
+      availableFrom: [peerId]
+    };
+    
+    // Start the download process in background
+    downloadFileFromPeers(downloadableFile, currentFolder)
+      .then(downloadedFile => {
+        console.log(`File downloaded successfully:`, downloadedFile);
+        showNotification(`File "${file.name}" downloaded from peer`, 'success');
+        
+        // Create a direct download link
+        const a = document.createElement('a');
+        a.href = downloadedFile.url;
+        a.download = file.name;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      })
+      .catch(error => {
+        console.error('Error downloading file from peers:', error);
+        showNotification(`Failed to download file: ${error.message}`, 'error');
+      });
+  }
+};
   
   // Calculate mime type from file name
   const getMimeTypeFromFileName = (filename) => {
