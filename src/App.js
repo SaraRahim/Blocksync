@@ -101,14 +101,16 @@ const BlockSyncApp = () => {
     };
   }, []);
 
-   // Instead of creating a new handleSignalEvent function, you should modify 
-// the signal event listener within your WebRTC setup useEffect.
+   // Reference to track current connection cycle (must be outside useEffect)
+const connectionCycleRef = useRef(Date.now());
 
-// Find this section in your useEffect that sets up WebRTC and update it:
-
-// Setup WebRTC and signaling connection when user is authenticated
+// 1. MAIN CONNECTION SETUP - Only depends on user and device ID
 useEffect(() => {
   if (!user) return;
+  
+  // Update connection cycle ID to ensure fresh connection
+  connectionCycleRef.current = Date.now();
+  const currentCycle = connectionCycleRef.current;
   
   // Initialize WebRTC peer connections
   const connectToPeerNetwork = async () => {
@@ -117,6 +119,9 @@ useEffect(() => {
       showNotification('Connecting to peer network...', 'info');
       const signalingServer = await connectToSignalingServer();
       
+      // Check if this effect is still current (prevents stale connections)
+      if (currentCycle !== connectionCycleRef.current) return;
+      
       // Update UI with connection state
       setPeerNetworkState(prev => ({
         ...prev,
@@ -124,7 +129,7 @@ useEffect(() => {
         networkId: signalingServer.networkId
       }));
       
-      // Announce our presence and register for events
+      // Announce our presence with initial folders
       signalingServer.announce({
         userId: user.uid,
         deviceId: activeDevice.id,
@@ -135,6 +140,16 @@ useEffect(() => {
         }))
       });
       
+      // Setup ping interval to keep connection alive
+      const pingInterval = setInterval(() => {
+        if (signalingServer && signalingServer.networkId) {
+          signalingServer.ping && signalingServer.ping();
+        } else {
+          clearInterval(pingInterval);
+        }
+      }, 25000);
+      
+      // Peer joined event handler
       signalingServer.on('peer-joined', async (peerInfo) => {
         console.log(`🟢 Peer joined:`, peerInfo);
         
@@ -153,89 +168,89 @@ useEffect(() => {
         };
         
         // Store the connection state for this peer
-          if (!peers.current[peerInfo.id] || peers.current[peerInfo.id].status === 'error') {
-            // Only create a new connection if we're the initiator and there isn't already a connection
-            // OR if there's an existing connection in error state
-            if (shouldInitiate) {
-              console.log(`Creating connection to ${peerInfo.id} as initiator`);
+        if (!peers.current[peerInfo.id] || peers.current[peerInfo.id].status === 'error') {
+          // Only create a new connection if we're the initiator and there isn't already a connection
+          // OR if there's an existing connection in error state
+          if (shouldInitiate) {
+            console.log(`Creating connection to ${peerInfo.id} as initiator`);
+            
+            // Clean up any existing connection properly
+            if (peers.current[peerInfo.id]) {
+              await safeDestroyPeer(peerInfo.id);
+              delete peers.current[peerInfo.id];
               
-              // Clean up any existing connection properly
-              if (peers.current[peerInfo.id]) {
-                await safeDestroyPeer(peerInfo.id);
-                delete peers.current[peerInfo.id];
-                
-                // Give time for cleanup to complete
-                await new Promise(resolve => setTimeout(resolve, 500));
-              }
+              // Give time for cleanup to complete
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+            
+            // Create and store preliminary connection state before actual connection
+            peers.current[peerInfo.id] = {
+              status: 'connecting',
+              peerId: peerInfo.id,
+              isInitiator: true,
+              ...peerConnectionState
+            };
+            
+            // Create new connection
+            try {
+              const peerConnection = await createPeerConnection(peerInfo.id, true, signalingServer);
               
-              // Create and store preliminary connection state before actual connection
-              peers.current[peerInfo.id] = {
-                status: 'connecting',
-                peerId: peerInfo.id,
-                isInitiator: true,
-                ...peerConnectionState
-              };
-              
-              // Create new connection
-              try {
-                const peerConnection = await createPeerConnection(peerInfo.id, true, signalingServer);
-                
-                  // Update with full connection info only if our connecting state still matches
+              // Update with full connection info only if our connecting state still matches
               // This prevents race conditions with simultaneous connection attempts
               if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
-                  peers.current[peerInfo.id] = {
-                    ...peerConnection,
-                    isInitiator: true,
-                    ...peerConnectionState
-                  };
-                } else {
-                  // A newer connection attempt has replaced our state, destroy this connection
-                  if (peerConnection.destroy) peerConnection.destroy();
-                  else if (peerConnection.peer && peerConnection.peer.destroy) peerConnection.peer.destroy();
-                }
-              } catch (error) {
-                console.error(`Error creating connection to ${peerInfo.id}:`, error);
-              if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
-                  peers.current[peerInfo.id].status = 'error';
-                }
+                peers.current[peerInfo.id] = {
+                  ...peerConnection,
+                  isInitiator: true,
+                  ...peerConnectionState
+                };
               }
-            } else {
-              console.log(`Waiting for ${peerInfo.id} to initiate connection to us`);
-              // Store state showing we're expecting an inbound connection
-              peers.current[peerInfo.id] = {
-                status: 'awaiting_offer',
-                peerId: peerInfo.id,
-                isInitiator: false,
-                ...peerConnectionState
-              };
+            } catch (error) {
+              console.error(`Error creating connection to ${peerInfo.id}:`, error);
+              if (peers.current[peerInfo.id] && peers.current[peerInfo.id].connectionAttemptTime === peerConnectionState.connectionAttemptTime) {
+                peers.current[peerInfo.id].status = 'error';
+              }
             }
           } else {
-            console.log(`Connection already exists or in progress for peer ${peerInfo.id}`);
+            console.log(`Waiting for ${peerInfo.id} to initiate connection to us`);
+            // Store state showing we're expecting an inbound connection
+            peers.current[peerInfo.id] = {
+              status: 'awaiting_offer',
+              peerId: peerInfo.id,
+              isInitiator: false,
+              ...peerConnectionState
+            };
           }
-          
-              // Check for common folders (keep this logic in both cases)
-              const commonFolders = syncFolders.filter(folder => 
-                peerInfo.folders.some(f => f.secretKey === folder.secretKey)
-              );
-              
-              console.log(`Common folders with peer ${peerInfo.id}:`, commonFolders.length);
-              
-              if (commonFolders.length > 0) {
-                // We have common folders with this peer, update folder device count
-                commonFolders.forEach(folder => {
-            // Update folder in state
-                  setSyncFolders(prev => prev.map(f => 
-                    f.id === folder.id
-                      ? { ...f, devices: f.devices + 1, peers: [...(f.peers || []), peerInfo.id] }
-                      : f
-                  ));
-                });
+        } else {
+          console.log(`Connection already exists or in progress for peer ${peerInfo.id}`);
+        }
+        
+        // Check for common folders (keep this logic in both cases)
+        const commonFolders = syncFolders.filter(folder => 
+          peerInfo.folders.some(f => f.secretKey === folder.secretKey)
+        );
+        
+        console.log(`Common folders with peer ${peerInfo.id}:`, commonFolders.length);
+        
+        if (commonFolders.length > 0) {
+          // We have common folders with this peer, update folder device count
+          commonFolders.forEach(folder => {
+            // Update folder in state - MOVED TO SEPARATE EFFECT
+            // Instead, dispatch a custom event that will be handled by a separate effect
+            const folderUpdateEvent = new CustomEvent('folderPeerUpdate', {
+              detail: { 
+                folderId: folder.id, 
+                peerId: peerInfo.id, 
+                action: 'add' 
               }
+            });
+            window.dispatchEvent(folderUpdateEvent);
+          });
+        }
       });
       
       // Listen for peer disconnect events
       signalingServer.on('peer-left', (peerId) => {
-        console.log(`🔴 Peer left:`, peerId); // Enhanced logging
+        console.log(`🔴 Peer left:`, peerId);
         
         // Clean up peer connection
         if (peers.current[peerId]) {
@@ -247,17 +262,12 @@ useEffect(() => {
           delete connectedPeers.current[peerId];
         }
         
-        // Update folders that had this peer
-        setSyncFolders(prev => prev.map(folder => {
-          if (folder.peers && folder.peers.includes(peerId)) {
-            return {
-              ...folder,
-              devices: Math.max(1, folder.devices - 1),
-              peers: folder.peers.filter(p => p !== peerId)
-            };
-          }
-          return folder;
-        }));
+        // Update folders that had this peer - MOVED TO SEPARATE EFFECT
+        // Dispatch a custom event for the peer left to update folders
+        const peerLeftEvent = new CustomEvent('peerLeft', {
+          detail: { peerId }
+        });
+        window.dispatchEvent(peerLeftEvent);
         
         // Update peer count
         setPeerNetworkState(prev => ({
@@ -266,6 +276,7 @@ useEffect(() => {
         }));
       });
       
+      // Signal event handler
       signalingServer.on('signal', async (data) => {
         const { from, signal } = data;
         
@@ -442,44 +453,293 @@ useEffect(() => {
   connectToPeerNetwork();
   
   // Cleanup when component unmounts or user logs out
-return () => {
-  console.log('Performing cleanup of WebRTC connections');
-  
-  // Disconnect from signaling server
-  if (socket.current) {
-    socket.current.disconnect();
-    socket.current = null;
-  }
-  
-  // Close all peer connections with proper cleanup
-  const peerIds = Object.keys(peers.current);
-  console.log(`Cleaning up ${peerIds.length} peer connections`);
-  
-  peerIds.forEach(peerId => {
-    safeDestroyPeer(peerId);
-  });
-  
-  // Clear all references
-  peers.current = {};
-  dataChannels.current = {};
-  connectedPeers.current = {};
-  
-  // Clean up any pending requests
-  const pendingRequestIds = Object.keys(pendingRequests.current);
-  if (pendingRequestIds.length > 0) {
-    console.log(`Cleaning up ${pendingRequestIds.length} pending requests`);
-    pendingRequestIds.forEach(id => {
-      const request = pendingRequests.current[id];
-      if (request.reject) {
-        request.reject(new Error('Component unmounting'));
-      }
+  return () => {
+    // Update connection cycle ref to invalidate any async operations
+    connectionCycleRef.current = Date.now();
+    
+    console.log('Performing cleanup of WebRTC connections');
+    
+    // Disconnect from signaling server
+    if (socket.current) {
+      socket.current.disconnect();
+      socket.current = null;
+    }
+    
+    // Close all peer connections with proper cleanup
+    const peerIds = Object.keys(peers.current);
+    console.log(`Cleaning up ${peerIds.length} peer connections`);
+    
+    peerIds.forEach(peerId => {
+      safeDestroyPeer(peerId);
     });
-    pendingRequests.current = {};
-  }
+    
+    // Clear all references
+    peers.current = {};
+    dataChannels.current = {};
+    connectedPeers.current = {};
+    
+    // Clean up any pending requests
+    const pendingRequestIds = Object.keys(pendingRequests.current);
+    if (pendingRequestIds.length > 0) {
+      console.log(`Cleaning up ${pendingRequestIds.length} pending requests`);
+      pendingRequestIds.forEach(id => {
+        const request = pendingRequests.current[id];
+        if (request.reject) {
+          request.reject(new Error('Component unmounting'));
+        }
+      });
+      pendingRequests.current = {};
+    }
+    
+    console.log('WebRTC cleanup completed');
+  };
+// Only depend on user and deviceId, not syncFolders
+}, [user, activeDevice.id]); 
+
+
+// 2. FOLDER UPDATES FROM PEERS - Listen for folder peer update events
+useEffect(() => {
+  // Function to handle folder peer updates
+  const handleFolderPeerUpdate = (event) => {
+    const { folderId, peerId, action } = event.detail;
+    
+    setSyncFolders(prev => prev.map(folder => {
+      if (folder.id === folderId) {
+        // For 'add' action, add the peer to the folder
+        if (action === 'add') {
+          const currentPeers = folder.peers || [];
+          const updatedPeers = currentPeers.includes(peerId) ? 
+            currentPeers : [...currentPeers, peerId];
+            
+          return {
+            ...folder,
+            devices: updatedPeers.length + 1, // +1 for our device
+            peers: updatedPeers
+          };
+        } 
+        // For 'remove' action, remove the peer from the folder
+        else if (action === 'remove') {
+          const updatedPeers = (folder.peers || []).filter(p => p !== peerId);
+          
+          return {
+            ...folder,
+            devices: Math.max(1, updatedPeers.length + 1), // Ensure at least 1 device (ours)
+            peers: updatedPeers
+          };
+        }
+      }
+      return folder;
+    }));
+  };
   
-  console.log('WebRTC cleanup completed');
+  // Function to handle peer left events
+  const handlePeerLeft = (event) => {
+    const { peerId } = event.detail;
+    
+    setSyncFolders(prev => prev.map(folder => {
+      if (folder.peers && folder.peers.includes(peerId)) {
+        const updatedPeers = folder.peers.filter(p => p !== peerId);
+        
+        return {
+          ...folder,
+          devices: Math.max(1, updatedPeers.length + 1), // Ensure at least 1 device
+          peers: updatedPeers
+        };
+      }
+      return folder;
+    }));
+  };
+  
+  // Add event listeners
+  window.addEventListener('folderPeerUpdate', handleFolderPeerUpdate);
+  window.addEventListener('peerLeft', handlePeerLeft);
+  
+  // Cleanup
+  return () => {
+    window.removeEventListener('folderPeerUpdate', handleFolderPeerUpdate);
+    window.removeEventListener('peerLeft', handlePeerLeft);
+  };
+}, []);
+
+
+// 3. FOLDER ANNOUNCEMENT EFFECT - Announces folder changes without reconnecting
+useEffect(() => {
+  if (!socket.current || !user) return;
+  
+  // Announce updated folders to the network
+  const announceFolders = () => {
+    try {
+      // Don't attempt if socket isn't connected
+      if (!socket.current.networkId) {
+        console.log('Socket not connected, skipping folder announcement');
+        return;
+      }
+      
+      console.log('Announcing folder updates to the network');
+      socket.current.announce({
+        userId: user.uid,
+        deviceId: activeDevice.id,
+        folders: syncFolders.map(folder => ({
+          id: folder.id,
+          secretKey: folder.secretKey,
+          shared: folder.shared
+        }))
+      });
+    } catch (err) {
+      console.error('Error announcing folders:', err);
+    }
+  };
+
+  // Set a small delay to prevent multiple rapid announcements
+  const timeoutId = setTimeout(announceFolders, 300);
+  
+  return () => clearTimeout(timeoutId);
+}, [syncFolders, user, activeDevice.id]);
+
+
+// 4. ENHANCED SIGNALING SERVER CONNECTION
+const connectToSignalingServer = async () => {
+  return new Promise((resolve, reject) => {
+    try {
+      // Try to connect to the signaling server
+      console.log(`Connecting to signaling server at ${SIGNALING_SERVER}`);
+      
+      const socketConnection = io(SIGNALING_SERVER, {
+        transports: ['websocket'],
+        reconnection: true,
+        reconnectionAttempts: 10, // Increased from 5
+        reconnectionDelay: 2000, // Increased from 1000
+        timeout: 20000, // Added longer timeout
+        query: {
+          userId: user.uid,
+          deviceId: activeDevice.id
+        }
+      });
+      
+      // Track connection attempts for debugging
+      let connectionAttempts = 0;
+      
+      // Set up event handlers
+      socketConnection.on('connect', () => {
+        console.log(`🟢 Connected to signaling server: ${socketConnection.id}`);
+        connectionAttempts = 0; // Reset counter on successful connection
+        
+        // Create the signaling interface
+        const signalingInterface = {
+          announce: (data) => {
+            console.log(`Announcing presence with folders:`, data.folders);
+            if (socketConnection.connected) {
+              socketConnection.emit('announce', data);
+            } else {
+              console.warn('Socket not connected, can\'t announce presence');
+            }
+          },
+          on: (event, callback) => {
+            socketConnection.on(event, callback);
+          },
+          send: (to, data) => {
+            console.log(`Sending signal to ${to}, type: ${data.type || 'candidate'}`);
+            if (socketConnection.connected) {
+              socketConnection.emit('signal', { to, signal: data });
+            } else {
+              console.warn(`Socket not connected, can't send signal to ${to}`);
+            }
+          },
+          networkId: socketConnection.id,
+          ping: () => {
+            if (socketConnection.connected) {
+              socketConnection.emit('ping');
+            }
+          },
+          disconnect: () => {
+            // Clean up event listeners before disconnecting
+            ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
+              socketConnection.off(event);
+            });
+            socketConnection.disconnect();
+          },
+          // Add this to safely clean up event listeners
+          removeAllListeners: () => {
+            ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
+              socketConnection.off(event);
+            });
+          }
+        };
+        
+        resolve(signalingInterface);
+      });
+      
+      socketConnection.on('connect_error', (err) => {
+        console.error('Connection error:', err);
+        connectionAttempts++;
+        
+        if (connectionAttempts >= 5) {
+          console.error(`Failed to connect after ${connectionAttempts} attempts`);
+          reject(err);
+        }
+      });
+      
+      socketConnection.on('connect_timeout', (err) => {
+        console.error('Connection timeout:', err);
+        connectionAttempts++;
+        
+        if (connectionAttempts >= 5) {
+          console.error(`Connection timed out after ${connectionAttempts} attempts`);
+          reject(new Error('Connection timeout'));
+        }
+      });
+      
+      // Add connection monitoring for debugging
+      socketConnection.on('disconnect', (reason) => {
+        console.error(`Signaling server disconnected: ${reason}`);
+        // Don't try to reconnect if we intentionally disconnected
+        if (reason === 'io client disconnect') {
+          return;
+        }
+      });
+      
+      socketConnection.on('reconnect_attempt', (attemptNumber) => {
+        console.log(`Attempting to reconnect to signaling server (attempt ${attemptNumber})`);
+      });
+      
+      socketConnection.on('reconnect', (attemptNumber) => {
+        console.log(`Reconnected to signaling server after ${attemptNumber} attempts`);
+      });
+      
+      socketConnection.on('reconnect_error', (err) => {
+        console.error('Reconnection error:', err);
+      });
+      
+      socketConnection.on('reconnect_failed', () => {
+        console.error('Failed to reconnect to signaling server');
+        reject(new Error('Reconnection failed'));
+      });
+      
+      // Add timeout for initial connection
+      const connectionTimeout = setTimeout(() => {
+        if (!socketConnection.connected) {
+          console.error('Connection to signaling server timed out');
+          socketConnection.close();
+          reject(new Error('Connection timeout'));
+        }
+      }, 15000); // Increased from 10000
+      
+      // Clear timeout when connected
+      socketConnection.on('connect', () => {
+        clearTimeout(connectionTimeout);
+      });
+      
+      // Handle pong from server to confirm active connection
+      socketConnection.on('pong', () => {
+        console.log('Received pong from server, connection still alive');
+      });
+      
+    } catch (error) {
+      console.error('Error connecting to signaling server:', error);
+      reject(error);
+    }
+  });
 };
-}, [user, syncFolders, activeDevice.id]); // Include all dependencies used in the effect
 
 const safeDestroyPeer = (peerId) => {
   try {
@@ -615,112 +875,7 @@ const safeDestroyPeer = (peerId) => {
     return false;
   }
 };
-  
-const connectToSignalingServer = async () => {
-  return new Promise((resolve, reject) => {
-    try {
-      // Try to connect to the signaling server
-      console.log(`Connecting to signaling server at ${SIGNALING_SERVER}`);
-      
-      const socketConnection = io(SIGNALING_SERVER, {
-        transports: ['websocket'],
-        reconnection: true,
-        reconnectionAttempts: 5,
-        reconnectionDelay: 1000,
-        query: {
-          userId: user.uid,
-          deviceId: activeDevice.id
-        }
-      });
-      
-      // Set up event handlers
-      socketConnection.on('connect', () => {
-        console.log(`🟢 Connected to signaling server: ${socketConnection.id}`);
-        
-        // Create the signaling interface
-const signalingInterface = {
-  announce: (data) => {
-            console.log(`Announcing presence with folders:`, 
-                       data.folders.map(f => f.secretKey));
-    socketConnection.emit('announce', data);
-  },
-  on: (event, callback) => {
-    socketConnection.on(event, callback);
-  },
-  send: (to, data) => {
-            console.log(`Sending signal to ${to}, type: ${data.type || 'candidate'}`);
-    socketConnection.emit('signal', { to, signal: data });
-  },
-          networkId: socketConnection.id,
-          disconnect: () => {
-            // Clean up event listeners before disconnecting
-            ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
-              socketConnection.off(event);
-            });
-            socketConnection.disconnect();
-          },
-          // Add this to safely clean up event listeners
-  removeAllListeners: () => {
-    ['connect', 'connect_error', 'connect_timeout', 'announce', 'peer-joined', 'peer-left', 'signal'].forEach(event => {
-      socketConnection.off(event);
-    });
-  }
-};
-        
-        resolve(signalingInterface);
-      });
-      
-      socketConnection.on('connect_error', (err) => {
-        console.error('Connection error:', err);
-        reject(err);
-      });
-      
-      socketConnection.on('connect_timeout', (err) => {
-        console.error('Connection timeout:', err);
-        reject(new Error('Connection timeout'));
-      });
-      
-      // Add connection monitoring for debugging
-      socketConnection.on('disconnect', (reason) => {
-        console.error(`Signaling server disconnected: ${reason}`);
-      });
-      
-      socketConnection.on('reconnect_attempt', (attemptNumber) => {
-        console.log(`Attempting to reconnect to signaling server (attempt ${attemptNumber})`);
-      });
-      
-      socketConnection.on('reconnect', (attemptNumber) => {
-        console.log(`Reconnected to signaling server after ${attemptNumber} attempts`);
-      });
-      
-      socketConnection.on('reconnect_error', (err) => {
-        console.error('Reconnection error:', err);
-      });
-      
-      socketConnection.on('reconnect_failed', () => {
-        console.error('Failed to reconnect to signaling server');
-      });
-      
-      // Add timeout for initial connection
-      const connectionTimeout = setTimeout(() => {
-        if (!socketConnection.connected) {
-          console.error('Connection to signaling server timed out');
-          socketConnection.close();
-          reject(new Error('Connection timeout'));
-        }
-      }, 10000);
-      
-      // Clear timeout when connected
-      socketConnection.on('connect', () => {
-        clearTimeout(connectionTimeout);
-      });
-      
-    } catch (error) {
-      console.error('Error connecting to signaling server:', error);
-      reject(error);
-    }
-  });
-};
+
 
 const createPeerConnection = async (peerId, initiator, signalingServer) => {
   return new Promise((resolve, reject) => {
@@ -3235,8 +3390,20 @@ const addFolderByKey = async (secretKey) => {
       }
     }
   }, [currentFolder, syncFolders]);
-
+  
   // If authentication is loading, show a loading screen
+  if (isAuthLoading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <div className="text-center">
+          <RefreshCw className="animate-spin h-12 w-12 text-blue-500 mx-auto mb-4" />
+          <h1 className="text-xl font-semibold text-gray-700">Loading BlockSync...</h1>
+        </div>
+      </div>
+    );
+  }
+  
+// If authentication is loading, show a loading screen
 if (isAuthLoading) {
   return (
     <div className="flex items-center justify-center h-screen bg-gray-900">
