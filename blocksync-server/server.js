@@ -11,12 +11,15 @@ app.use(cors());
 // Create HTTP server
 const server = http.createServer(app);
 
-// Create Socket.IO server
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow connections from any origin
-    methods: ["GET", "POST"]
-  }
+    origin: ["https://your-firebase-app.web.app", "https://your-firebase-app.firebaseapp.com"],
+    methods: ["GET", "POST"],
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"]
+  },
+  allowEIO3: true, // Add support for older Socket.IO clients
+  transports: ['websocket', 'polling'] // Ensure both transports are available
 });
 
 const announceTimestamps = new Map(); // Rate limiter for announce events
