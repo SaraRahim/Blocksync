@@ -1556,44 +1556,45 @@ const handlePeerMessage = (message, peerId) => {
     }
   };
   
-// 4. Modify your handleBinaryData function to better handle file chunks
-const handleBinaryData = (data, peerId) => {
-  console.log(`📦 Received binary data from peer ${peerId}, size: ${data.byteLength || 'unknown'} bytes`);
-  
-  // Find the corresponding pending request
-  const pendingRequest = Object.values(pendingRequests.current).find(
-    req => req.peerId === peerId && req.status === 'pending'
-  );
-  
-  if (pendingRequest) {
-    console.log(`Found matching pending request for binary data: ${pendingRequest.id}`);
+  const handleBinaryData = (data, peerId) => {
+    console.log(`📦 Received binary data from peer ${peerId}, size: ${data.byteLength || 'unknown'} bytes`);
     
-    // Update the request
-    pendingRequest.status = 'received';
-    pendingRequest.data = data;
+    // Find the corresponding pending request
+    const pendingRequest = Object.values(pendingRequests.current).find(
+      req => req.peerId === peerId && (req.status === 'pending' || req.status === 'waiting')
+    );
     
-    // Clean up if there's a cleanup function
-    if (pendingRequest.cleanup) {
-      pendingRequest.cleanup();
-    } else {
-      // Otherwise just remove the message handler
-      const peerObj = peers.current[peerId];
-      if (peerObj && peerObj.removeMessageHandler && pendingRequest.handlerId) {
-        peerObj.removeMessageHandler(pendingRequest.handlerId);
+    if (pendingRequest) {
+      console.log(`Found matching pending request for binary data: ${pendingRequest.id}`);
+      
+      // Update the request
+      pendingRequest.status = 'received';
+      pendingRequest.data = data;
+      
+      // Clean up if there's a cleanup function
+      if (typeof pendingRequest.cleanup === 'function') {
+        pendingRequest.cleanup();
+      } else {
+        // Otherwise just remove the message handler
+        const peerObj = peers.current[peerId];
+        if (peerObj && peerObj.removeMessageHandler && pendingRequest.handlerId) {
+          peerObj.removeMessageHandler(pendingRequest.handlerId);
+        }
       }
+      
+      // Resolve the promise
+      if (typeof pendingRequest.resolve === 'function') {
+        pendingRequest.resolve(data);
+      }
+      return true;
+    } else {
+      console.log('Received unexpected binary data from peer:', peerId);
+      return false;
     }
-    
-    // Resolve the promise
-    pendingRequest.resolve(data);
-    return true;
-  } else {
-    console.log('Received unexpected binary data from peer:', peerId);
-    return false;
-  }
-};
+  };
 
   
-// Handle file request from a peer
+// Enhanced file request handler function 
 const handleFileRequest = async (request, peerId) => {
   const { fileId, folderId, chunkStart, chunkEnd, requestId } = request;
   
@@ -1635,45 +1636,112 @@ const handleFileRequest = async (request, peerId) => {
       return;
     }
     
-    // Fetch the file data
-    const response = await fetch(file.url);
-    const fileData = await response.arrayBuffer();
-    
-    // Get the requested chunk
-    const chunk = fileData.slice(chunkStart, chunkEnd);
-    
-    // Send response with chunk metadata
-    sendPeerMessage(peerId, {
-      type: 'FILE_RESPONSE',
-      data: {
-        requestId,
-        fileId,
-        folderId,
-        chunkStart,
-        chunkEnd,
-        totalSize: fileData.byteLength,
-        success: true
+    // Special case for metadata-only requests (when chunkStart == 0 and chunkEnd == 0 or 1)
+    if (chunkStart === 0 && (chunkEnd === 0 || chunkEnd === 1)) {
+      console.log(`Metadata-only request for file ${fileId}`);
+      
+      try {
+        // Fetch just enough to get the file size
+        const response = await fetch(file.url);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const totalSize = file.size || (await response.blob()).size;
+        
+        // For metadata requests, just send the file info
+        sendPeerMessage(peerId, {
+          type: 'FILE_RESPONSE',
+          data: {
+            requestId,
+            fileId,
+            folderId,
+            fileName: file.name,
+            fileType: file.type,
+            totalSize,
+            chunkSize,
+            success: true
+          }
+        });
+        return;
+      } catch (error) {
+        console.error('Error getting file metadata:', error);
+        sendPeerMessage(peerId, {
+          type: 'FILE_RESPONSE',
+          data: {
+            requestId,
+            error: `Error getting file metadata: ${error.message}`
+          }
+        });
+        return;
       }
-    });
+    }
     
-    // Wait a small amount of time to ensure the FILE_RESPONSE is processed first
-    await new Promise(resolve => setTimeout(resolve, 50));
-    
-    // Send the binary data directly
-    const peer = connectedPeers.current[peerId];
-    if (peer && peer.sendBinary) {
-      // Use our enhanced sendBinary method
-      peer.sendBinary(new Uint8Array(chunk));
-    } else if (peer && peer.dataChannel && peer.dataChannel.readyState === 'open') {
-      // Fallback to direct data channel send
-      peer.dataChannel.send(new Uint8Array(chunk));
-    } else {
-      console.error(`Unable to send binary data to peer ${peerId}`);
+    // Fetch the file data
+    try {
+      const response = await fetch(file.url);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const fileData = await response.arrayBuffer();
+      console.log(`Got file data, size: ${fileData.byteLength} bytes`);
+      
+      // Make sure the requested chunk is within bounds
+      if (chunkStart >= fileData.byteLength) {
+        throw new Error('Requested chunk start is beyond file size');
+      }
+      
+      // Get the requested chunk
+      const adjustedChunkEnd = Math.min(chunkEnd, fileData.byteLength);
+      const chunk = fileData.slice(chunkStart, adjustedChunkEnd);
+      console.log(`Sending chunk from ${chunkStart} to ${adjustedChunkEnd}, size: ${chunk.byteLength} bytes`);
+      
+      // Send response with chunk metadata
       sendPeerMessage(peerId, {
         type: 'FILE_RESPONSE',
         data: {
           requestId,
-          error: 'Failed to send binary data'
+          fileId,
+          folderId,
+          chunkStart,
+          chunkEnd: adjustedChunkEnd,
+          totalSize: fileData.byteLength,
+          chunkSize: chunk.byteLength,
+          success: true
+        }
+      });
+      
+      // Wait a small amount of time to ensure the FILE_RESPONSE is processed first
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Send the binary data directly
+      const peer = connectedPeers.current[peerId];
+      if (peer && peer.sendBinary) {
+        // Use our enhanced sendBinary method
+        console.log(`Sending binary chunk using sendBinary, size: ${chunk.byteLength} bytes`);
+        peer.sendBinary(new Uint8Array(chunk));
+      } else if (peer && peer.dataChannel && peer.dataChannel.readyState === 'open') {
+        // Fallback to direct data channel send
+        console.log(`Sending binary chunk using dataChannel.send, size: ${chunk.byteLength} bytes`);
+        peer.dataChannel.send(new Uint8Array(chunk));
+      } else {
+        console.error(`Unable to send binary data to peer ${peerId}`);
+        sendPeerMessage(peerId, {
+          type: 'FILE_RESPONSE',
+          data: {
+            requestId,
+            error: 'Failed to send binary data'
+          }
+        });
+      }
+    } catch (error) {
+      console.error(`Error fetching file data:`, error);
+      sendPeerMessage(peerId, {
+        type: 'FILE_RESPONSE',
+        data: {
+          requestId,
+          error: `Error fetching file data: ${error.message}`
         }
       });
     }
@@ -1689,6 +1757,60 @@ const handleFileRequest = async (request, peerId) => {
       }
     });
   }
+};
+
+// 1. Add this new function to automatically sync files in the background
+const syncFilesInBackground = async (folder) => {
+  if (!folder || !folder.files || folder.files.length === 0) return;
+  
+  console.log(`Starting background sync for folder: ${folder.name}`);
+  
+  // Get all files that need syncing (not already synced)
+  const filesToSync = folder.files.filter(file => !file.synced && !file.url);
+  
+  if (filesToSync.length === 0) {
+    console.log(`All files in folder ${folder.name} are already synced`);
+    return;
+  }
+  
+  console.log(`Found ${filesToSync.length} files to sync in folder ${folder.name}`);
+  
+  // Get all connected peers
+  const connectedPeerIds = Object.keys(connectedPeers.current);
+  if (connectedPeerIds.length === 0) {
+    console.log('No connected peers available for background sync');
+    return;
+  }
+  
+  // Process files one by one to avoid overwhelming the connection
+  for (const file of filesToSync) {
+    try {
+      // Skip if already being downloaded or already synced
+      if (downloadProgress[file.id]?.status === 'downloading' || file.synced) {
+        continue;
+      }
+      
+      console.log(`Background syncing file: ${file.name}`);
+      
+      // Create a downloadable file with the available peer
+      const downloadableFile = {
+        ...file,
+        availableFrom: [connectedPeerIds[0]] // Use first connected peer
+      };
+      
+      // Download the file in background
+      await downloadFileFromPeers(downloadableFile, folder);
+      
+      // Short pause between files
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+    } catch (error) {
+      console.error(`Error syncing file ${file.name} in background:`, error);
+      // Continue with next file on error
+    }
+  }
+  
+  console.log(`Background sync completed for folder: ${folder.name}`);
 };
   
   // Handle file response from a peer
@@ -1770,7 +1892,6 @@ const handleFileRequest = async (request, peerId) => {
     }
   };
   
-  // Handle file available notification from a peer
   const handleFileAvailable = (fileInfo, peerId) => {
     const { fileId, folderId } = fileInfo;
     
@@ -1821,6 +1942,24 @@ const handleFileRequest = async (request, peerId) => {
         }
         return file;
       }));
+      
+      // If the file is not synced, consider syncing it in the background
+      const fileToSync = folder.files.find(f => f.id === fileId && !f.synced);
+      if (fileToSync && Object.keys(downloadProgress).filter(id => 
+        downloadProgress[id].status === 'downloading').length < 2) {  // Limit concurrent background downloads
+        
+        // Start background sync for this file 
+        const downloadableFile = {
+          ...fileToSync,
+          availableFrom: [peerId]
+        };
+        
+        // Use timeout to avoid immediate download and allow UI to update
+        setTimeout(() => {
+          downloadFileFromPeers(downloadableFile, folder)
+            .catch(err => console.error(`Background sync failed for ${fileToSync.name}:`, err));
+        }, 2000);
+      }
     }
   };
   
@@ -1906,97 +2045,102 @@ const broadcastFolderAddedByKey = (folder, files) => {
     return successCount;
   };
   
-// 3. Replace your requestFileChunk function with this one
-const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folderId) => {
-  console.log(`Requesting file chunk from peer ${peerWrapper.peerId}: file=${fileId}, folder=${folderId}, range=${chunkStart}-${chunkEnd}`);
-  
-  return new Promise((resolve, reject) => {
-    // Generate a unique request ID
-    const requestId = 'req_' + Math.random().toString(36).substr(2, 9);
-    let handlerId = null;
-    let binaryDataTimeout = null;
+  const requestFileChunk = async (peerWrapper, fileId, chunkStart, chunkEnd, folderId) => {
+    console.log(`Requesting file chunk from peer ${peerWrapper.peerId}: file=${fileId}, folder=${folderId}, range=${chunkStart}-${chunkEnd}`);
     
-    // Function to cleanup resources
-    const cleanup = () => {
-      if (peerWrapper && peerWrapper.removeMessageHandler && handlerId) {
-        peerWrapper.removeMessageHandler(handlerId);
-      }
-      if (binaryDataTimeout) {
-        clearTimeout(binaryDataTimeout);
-      }
-      delete pendingRequests.current[requestId];
-    };
-    
-    // Send the request
-    try {
-      // Add a handler for the FILE_RESPONSE message
-      handlerId = peerWrapper.addMessageHandler('FILE_RESPONSE', (message) => {
-        if (message.data && message.data.requestId === requestId) {
-          const { error, success } = message.data;
-          
-          if (error) {
-            // The request failed
-            cleanup();
-            reject(new Error(error));
-            return true; // Mark as handled
-          } else if (success) {
-            console.log(`Received FILE_RESPONSE success for ${requestId}, awaiting binary chunk`);
-            
-            // Set a timeout for receiving the binary data
-            binaryDataTimeout = setTimeout(() => {
-              console.error(`Timeout waiting for binary data for request ${requestId}`);
-              cleanup();
-              reject(new Error('Timeout waiting for binary data'));
-            }, 20000); // 20 second timeout
-            
-            return true; // Mark as handled
-          }
-        }
-        return false; // Not handled
-      }, 40000); // 40 second timeout (longer than the binary data timeout)
+    return new Promise((resolve, reject) => {
+      // Generate a unique request ID
+      const requestId = 'req_' + Math.random().toString(36).substr(2, 9);
+      let handlerId = null;
+      let binaryDataTimeout = null;
       
-      // Store this request so we can match binary data to it
-      pendingRequests.current[requestId] = {
-        id: requestId,
-        fileId,
-        folderId,
-        chunkStart,
-        chunkEnd,
-        status: 'pending',
-        createdAt: new Date(),
-        peerId: peerWrapper.peerId,
-        resolve,
-        reject,
-        handlerId,
-        cleanup
+      // Function to cleanup resources
+      const cleanup = () => {
+        if (peerWrapper && peerWrapper.removeMessageHandler && handlerId) {
+          peerWrapper.removeMessageHandler(handlerId);
+        }
+        if (binaryDataTimeout) {
+          clearTimeout(binaryDataTimeout);
+        }
+        delete pendingRequests.current[requestId];
       };
       
-      // Send the request message
-      const success = peerWrapper.send({
-        type: 'FILE_REQUEST',
-        data: {
-          requestId,
+      // Send the request
+      try {
+        // Add a handler for the FILE_RESPONSE message
+        handlerId = peerWrapper.addMessageHandler('FILE_RESPONSE', (message) => {
+          if (message.data && message.data.requestId === requestId) {
+            const { error, success } = message.data;
+            
+            if (error) {
+              // The request failed
+              cleanup();
+              reject(new Error(error));
+              return true; // Mark as handled
+            } else if (success) {
+              console.log(`Received FILE_RESPONSE success for ${requestId}, awaiting binary chunk`);
+              
+              // Update the request status to waiting for binary data
+              if (pendingRequests.current[requestId]) {
+                pendingRequests.current[requestId].status = 'waiting';
+              }
+              
+              // Set a timeout for receiving the binary data
+              binaryDataTimeout = setTimeout(() => {
+                console.error(`Timeout waiting for binary data for request ${requestId}`);
+                cleanup();
+                reject(new Error('Timeout waiting for binary data'));
+              }, 20000); // 20 second timeout
+              
+              return true; // Mark as handled
+            }
+          }
+          return false; // Not handled
+        }, 40000); // 40 second timeout (longer than the binary data timeout)
+        
+        // Store this request so we can match binary data to it
+        pendingRequests.current[requestId] = {
+          id: requestId,
           fileId,
           folderId,
           chunkStart,
-          chunkEnd
+          chunkEnd,
+          status: 'pending',
+          createdAt: new Date(),
+          peerId: peerWrapper.peerId,
+          resolve,
+          reject,
+          handlerId,
+          cleanup
+        };
+        
+        // Send the request message
+        const success = peerWrapper.send({
+          type: 'FILE_REQUEST',
+          data: {
+            requestId,
+            fileId,
+            folderId,
+            chunkStart,
+            chunkEnd
+          }
+        });
+        
+        if (!success) {
+          throw new Error('Failed to send request to peer');
         }
-      });
-      
-      if (!success) {
-        throw new Error('Failed to send request to peer');
+        
+        console.log(`File chunk request sent to peer ${peerWrapper.peerId}`);
+      } catch (error) {
+        cleanup();
+        reject(error);
       }
-      
-      console.log(`File chunk request sent to peer ${peerWrapper.peerId}`);
-    } catch (error) {
-      cleanup();
-      reject(error);
-    }
-  });
-};
+    });
+  };
+  
 
   
-// 2. Replace your downloadFileFromPeers function with this one
+// Enhanced downloadFileFromPeers with better binary handling
 const downloadFileFromPeers = async (file, folder) => {
   console.log(`Starting downloadFileFromPeers for file:`, file.name);
   
@@ -2109,72 +2253,104 @@ const downloadFileFromPeers = async (file, folder) => {
     // Initialize array buffer to store the full file
     const fileData = new Uint8Array(fileSize);
     
+    // Track which chunks have been downloaded to prevent duplicates
+    const downloadedChunks = new Set();
+    
     // Download the chunks
     let downloaded = 0;
-    const maxConcurrentRequests = 1; // Reduced to 1 to prevent connection issues
     
-    // Process chunks in batches
-    for (let i = 0; i < chunks; i += maxConcurrentRequests) {
-      console.log(`Processing chunk batch ${i + 1} / ${chunks}`);
-      const chunkPromises = [];
-      
-      // Create promises for concurrent chunk downloads
-      for (let j = 0; j < maxConcurrentRequests && i + j < chunks; j++) {
-        const chunkIndex = i + j;
-        const chunkStart = chunkIndex * chunkSize;
-        const chunkEnd = Math.min(chunkStart + chunkSize, fileSize);
-        
-        console.log(`Requesting chunk ${chunkIndex+1}/${chunks} (${chunkStart}-${chunkEnd})`);
-        
-        const chunkPromise = peer.requestFile(file.id, folder.id, chunkStart, chunkEnd)
-          .then(chunkData => {
-            // Ensure we received binary data
-            if (!(chunkData instanceof ArrayBuffer) && !(chunkData instanceof Uint8Array)) {
-              console.error(`Received non-binary data for chunk ${chunkIndex}:`, chunkData);
-              throw new Error('Received non-binary data for file chunk');
-            }
-            
-            // Convert to Uint8Array if needed
-            const chunkUint8 = chunkData instanceof ArrayBuffer ? 
-              new Uint8Array(chunkData) : chunkData;
-            
-            console.log(`Received chunk ${chunkIndex+1} successfully, size: ${chunkUint8.byteLength} bytes`);
-            
-            // Store the chunk at the correct position in the full file data
-            fileData.set(chunkUint8, chunkStart);
-            
-            downloaded += chunkUint8.byteLength;
-            
-            // Update progress
-            setDownloadProgress({
-              fileId: file.id,
-              progress: Math.round((downloaded / fileSize) * 100),
-              status: 'downloading'
-            });
-            
-            return chunkData;
-          })
-          .catch(error => {
-            console.error(`Error downloading chunk ${chunkIndex}:`, error);
-            throw new Error(`Chunk ${chunkIndex} download failed: ${error.message || 'Unknown error'}`);
-          });
-        
-        chunkPromises.push(chunkPromise);
+    // Process chunks one by one to ensure reliability
+    for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++) {
+      if (downloadedChunks.has(chunkIndex)) {
+        console.log(`Skipping already downloaded chunk ${chunkIndex+1}/${chunks}`);
+        continue;
       }
       
-      // Wait for this batch of chunks
-      await Promise.all(chunkPromises);
+      const chunkStart = chunkIndex * chunkSize;
+      const chunkEnd = Math.min(chunkStart + chunkSize, fileSize);
       
-      // Brief pause between batches to prevent overwhelming the connection
+      console.log(`Requesting chunk ${chunkIndex+1}/${chunks} (${chunkStart}-${chunkEnd})`);
+      
+      try {
+        // Try up to 3 times for each chunk
+        let chunkData = null;
+        let attempts = 0;
+        
+        while (!chunkData && attempts < 3) {
+          attempts++;
+          try {
+            chunkData = await peer.requestFile(file.id, folder.id, chunkStart, chunkEnd);
+          } catch (err) {
+            console.warn(`Attempt ${attempts}/3 failed for chunk ${chunkIndex+1}: ${err.message}`);
+            // If not the last attempt, wait before retrying
+            if (attempts < 3) {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            } else {
+              throw err; // Re-throw on last attempt
+            }
+          }
+        }
+        
+        // Ensure we received binary data
+        if (!(chunkData instanceof ArrayBuffer) && !(chunkData instanceof Uint8Array)) {
+          throw new Error(`Received non-binary data for chunk ${chunkIndex}`);
+        }
+        
+        // Convert to Uint8Array if needed
+        const chunkUint8 = chunkData instanceof ArrayBuffer ? 
+          new Uint8Array(chunkData) : chunkData;
+        
+        console.log(`Received chunk ${chunkIndex+1} successfully, size: ${chunkUint8.byteLength} bytes`);
+        
+        // Store the chunk at the correct position in the full file data
+        fileData.set(chunkUint8, chunkStart);
+        downloadedChunks.add(chunkIndex);
+        
+        downloaded += chunkUint8.byteLength;
+        
+        // Update progress
+        setDownloadProgress({
+          fileId: file.id,
+          progress: Math.round((downloaded / fileSize) * 100),
+          status: 'downloading'
+        });
+      } catch (error) {
+        console.error(`Error downloading chunk ${chunkIndex}:`, error);
+        throw new Error(`Error downloading chunk ${chunkIndex+1}/${chunks}: ${error.message}`);
+      }
+      
+      // Brief pause between chunks to prevent overwhelming the connection
       await new Promise(resolve => setTimeout(resolve, 200));
     }
     
     console.log(`Download complete for ${file.name}, creating blob`);
     
-    // Create a blob from the file data
-    const mimeType = getMimeTypeFromFileName(file.name) || 'application/octet-stream';
-    console.log(`Using MIME type: ${mimeType}`);
+    // Determine the correct MIME type
+    const fileExtension = file.name.split('.').pop().toLowerCase();
     
+    // Specific handling for different file types
+    let mimeType;
+    
+    // Special case for images
+    if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].includes(fileExtension)) {
+      mimeType = 'image/' + (fileExtension === 'jpg' ? 'jpeg' : fileExtension);
+    } 
+    // Special case for documents
+    else if (['pdf'].includes(fileExtension)) {
+      mimeType = 'application/pdf';
+    }
+    else if (['doc', 'docx'].includes(fileExtension)) {
+      mimeType = fileExtension === 'doc' ? 'application/msword' : 
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+    }
+    // Default case
+    else {
+      mimeType = getMimeTypeFromFileName(file.name) || 'application/octet-stream';
+    }
+    
+    console.log(`Using MIME type: ${mimeType} for file ${file.name}`);
+    
+    // Create a blob from the file data
     const blob = new Blob([fileData], { type: mimeType });
     const fileUrl = URL.createObjectURL(blob);
     
@@ -3403,28 +3579,35 @@ const addFolderByKey = async (secretKey) => {
     showNotification(`${files.length} file${files.length !== 1 ? 's' : ''} added successfully`, 'success');
   };
   
-  // 1. Replace your downloadFile function with this one
+// 3. Update the downloadFile function to be instant when files are already synced
 const downloadFile = (file) => {
   console.log(`Attempting to download file:`, file);
   
   if (file.url) {
-    // If we have a direct URL (from browser storage), use it
-    console.log(`File has URL, downloading directly: ${file.name}`);
-    const a = document.createElement('a');
-    a.href = file.url;
-    a.download = file.name;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    
-    showNotification(`File "${file.name}" downloaded`, 'success');
-  } else {
-    // For files without URL, try to download from any available peer
-    console.log(`File needs to be downloaded from peers: ${file.name}`);
-    
+    try {
+      // File is already synced, download instantly
+      console.log(`File has URL, downloading directly: ${file.name}`);
+      const a = document.createElement('a');
+      a.href = file.url;
+      a.download = file.name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      
+      showNotification(`File "${file.name}" downloaded`, 'success');
+    } catch (err) {
+      console.error(`Error downloading local file:`, err);
+      showNotification(`Error downloading file: ${err.message}`, 'error');
+    }
+  } 
+  // If file is being downloaded in the background
+  else if (downloadProgress[file.id]?.status === 'downloading') {
+    showNotification(`File "${file.name}" is currently syncing (${downloadProgress[file.id].progress}%). Please wait...`, 'info');
+  }
+  // If file needs to be downloaded now
+  else {
     // Get all connected peers
     const connectedPeerIds = Object.keys(connectedPeers.current);
-    console.log(`Currently connected peers: ${connectedPeerIds.length}`, connectedPeerIds);
     
     if (connectedPeerIds.length === 0) {
       showNotification('No peers available to download file', 'error');
@@ -3433,9 +3616,7 @@ const downloadFile = (file) => {
     
     // Use the first connected peer
     const peerId = connectedPeerIds[0];
-    console.log(`Will attempt to download from peer: ${peerId}`);
-    
-    showNotification('Downloading file from peers...', 'info');
+    showNotification(`Downloading file "${file.name}" from peers...`, 'info');
     
     // Create a modified file object with the available peer
     const downloadableFile = {
@@ -3443,7 +3624,7 @@ const downloadFile = (file) => {
       availableFrom: [peerId]
     };
     
-    // Start the download process in background
+    // Start the download process
     downloadFileFromPeers(downloadableFile, currentFolder)
       .then(downloadedFile => {
         console.log(`File downloaded successfully:`, downloadedFile);
@@ -3463,6 +3644,7 @@ const downloadFile = (file) => {
       });
   }
 };
+
   
   // Calculate mime type from file name
   const getMimeTypeFromFileName = (filename) => {
@@ -3499,7 +3681,6 @@ const downloadFile = (file) => {
     return mimeTypes[extension] || 'application/octet-stream';
   };
   
-  // Load files for a folder when selected
   useEffect(() => {
     if (currentFolder) {
       const folder = syncFolders.find(f => f.id === currentFolder.id);
@@ -3516,6 +3697,15 @@ const downloadFile = (file) => {
           }));
           
           setFolderFiles(fullFiles);
+          
+          // Start background syncing if folder has peers
+          if (folder.peers && folder.peers.length > 0 && 
+              folder.files.some(file => !file.synced && !file.url)) {
+            // Use setTimeout to not block the UI rendering
+            setTimeout(() => {
+              syncFilesInBackground(folder);
+            }, 500);
+          }
         } else {
           setFolderFiles([]);
         }
@@ -3525,7 +3715,7 @@ const downloadFile = (file) => {
         setFolderFiles([]);
       }
     }
-  }, [currentFolder, syncFolders]);
+  }, [currentFolder, syncFolders])
   
   // If authentication is loading, show a loading screen
   if (isAuthLoading) {
