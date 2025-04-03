@@ -24,7 +24,8 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 
 // Signaling server URL - replace with your actual signaling server
-const SIGNALING_SERVER = "http://localhost:3001";
+// const SIGNALING_SERVER = "http://localhost:3001";
+const SIGNALING_SERVER = "https://blocksync-signal.onrender.com";
 
 const BlockSyncApp = () => {
   // Cross-tab communication channel for local testing
